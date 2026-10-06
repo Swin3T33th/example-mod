@@ -1,6 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -16,11 +17,14 @@ static constexpr int kFwd = 5;
 static constexpr int kSnapEvery = 4;
 static constexpr int kMargin = 2;
 static constexpr int kHorizon = 30;
+static constexpr int kTrigGuard = 120;
 static constexpr int kNoClick = 1000;
-static constexpr float kStepDt = 1.f / 240.f;
+static constexpr float kStepDt = 1.001f / 240.f;
 
 static int g_frame = 0;
 static std::array<int, 7> g_counts = {0, 0, 0, 0, 0, 0, 0};
+static std::array<int, 7> g_dbg = {0, 0, 0, 0, 0, 0, 0};
+static int g_lastAdv = 1;
 
 static const char* g_names[7] = {"9+:", "7-8:", "5-6:", "4:", "3:", "2:", "1:"};
 static const ccColor3B g_colors[7] = {
@@ -47,6 +51,7 @@ static std::deque<Snap> g_ring;
 static std::vector<Input> g_log;
 static std::vector<Open> g_waiting;
 static std::vector<Pending> g_pending;
+static std::vector<int> g_trigFrames;
 static bool g_probing = false;
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
@@ -60,6 +65,7 @@ static void clearProbeState() {
     for (auto& p : g_pending) p.base->release();
     g_pending.clear();
     g_log.clear();
+    g_trigFrames.clear();
 }
 
 static void pushSnap(PlayLayer* pl) {
@@ -95,6 +101,17 @@ static std::vector<Input> buildInputs(const Pending& p, int d) {
     return out;
 }
 
+class $modify(FrameTrigger, EffectGameObject) {
+    void triggerObject(GJBaseGameLayer* layer, int p1, gd::vector<int> const* p2) {
+        if (g_probing) return;
+        if (PlayLayer::get()) {
+            g_trigFrames.push_back(g_frame);
+            if (g_trigFrames.size() > 256) g_trigFrames.erase(g_trigFrames.begin());
+        }
+        EffectGameObject::triggerObject(layer, p1, p2);
+    }
+};
+
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
@@ -115,6 +132,7 @@ class $modify(FrameBase, GJBaseGameLayer) {
 
         g_log.push_back({g_frame, down});
         if (!down) return;
+        g_dbg[5]++;
 
         Snap* best = nullptr;
         for (auto& s : g_ring) {
@@ -135,6 +153,7 @@ class $modify(FrameBase, GJBaseGameLayer) {
 class $modify(FrameLayer, PlayLayer) {
     struct Fields {
         CCLabelBMFont* frameLabel = nullptr;
+        CCLabelBMFont* dbgLabel = nullptr;
         std::array<CCLabelBMFont*, 7> values = {};
         CheckpointObject* saved = nullptr;
         int savedFrame = 0;
@@ -150,6 +169,7 @@ class $modify(FrameLayer, PlayLayer) {
         int before = g_probeTick;
         GJBaseGameLayer::update(kStepDt);
         int advanced = g_probeTick - before;
+        g_lastAdv = advanced;
         if (advanced != 1) {
             log::warn("Sondeo: update({}) avanzó {} frames (se esperaba 1)", kStepDt, advanced);
             g_probeInvalid = true;
@@ -179,18 +199,35 @@ class $modify(FrameLayer, PlayLayer) {
     }
 
     int probeWindow(const Pending& p) {
+        for (int f : g_trigFrames) {
+            if (f >= p.baseFrame - kTrigGuard && f < p.endFrame) {
+                g_dbg[6]++;
+                log::info("Click f{}: hay un trigger cerca, descartado", p.clickFrame);
+                return -1;
+            }
+        }
+
         auto live = this->createCheckpoint();
         if (!live) return -1;
         live->retain();
+        g_dbg[0]++;
 
         int dMin = std::max(-kBack, p.baseFrame - p.clickFrame);
         int dMax = std::max(0, std::min(kFwd, p.endFrame - kMargin - 1 - p.clickFrame));
 
         int w = -1;
         int r0 = survives(p, 0);
-        if (r0 == 1) {
+        if (r0 == -1) {
+            g_dbg[4]++;
+        } else if (r0 == 0) {
+            g_dbg[3]++;
+            log::warn("Sondeo: d=0 murió; click en frame {} descartado", p.clickFrame);
+        } else {
             int rNo = survives(p, kNoClick);
-            if (rNo == 1) {
+            if (rNo == -1) {
+                g_dbg[4]++;
+            } else if (rNo == 1) {
+                g_dbg[2]++;
                 log::info("Click f{}: no hace falta (sobrevive sin click), descartado", p.clickFrame);
             } else {
                 w = 1;
@@ -202,10 +239,9 @@ class $modify(FrameLayer, PlayLayer) {
                     if (survives(p, d) != 1) break;
                     w++;
                 }
+                g_dbg[1]++;
                 log::info("Click f{}: ventana {}", p.clickFrame, w);
             }
-        } else {
-            log::warn("Sondeo: d=0 dio {} (esperaba 1); click en frame {} descartado", r0, p.clickFrame);
         }
 
         this->loadFromCheckpoint(live);
@@ -239,6 +275,7 @@ class $modify(FrameLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         resetCounters();
+        g_dbg.fill(0);
 
         CCNode* parent = this;
         if (m_uiLayer) parent = m_uiLayer;
@@ -293,6 +330,15 @@ class $modify(FrameLayer, PlayLayer) {
         parent->addChild(fl);
         m_fields->frameLabel = fl;
 
+        auto dl = CCLabelBMFont::create("-", "bigFont.fnt");
+        dl->setScale(kScale * 0.5f);
+        dl->setAnchorPoint({0.f, 1.f});
+        dl->setPosition({left + totalW + 8.f, top - 24.f});
+        dl->setColor({255, 255, 0});
+        dl->setZOrder(101);
+        parent->addChild(dl);
+        m_fields->dbgLabel = dl;
+
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
         menu->setZOrder(100);
@@ -339,6 +385,11 @@ class $modify(FrameLayer, PlayLayer) {
         if (m_fields->frameLabel) {
             std::string s = fmt::format("Frame: {}", g_frame);
             m_fields->frameLabel->setString(s.data());
+        }
+        if (m_fields->dbgLabel) {
+            std::string s = fmt::format("clk {} son {} ok {}\nsc {} d0 {} pas {} trg {} adv {}",
+                g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[6], g_lastAdv);
+            m_fields->dbgLabel->setString(s.data());
         }
         for (int i = 0; i < 7; i++) {
             if (m_fields->values[i]) {
