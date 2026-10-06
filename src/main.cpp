@@ -16,12 +16,12 @@ static constexpr int kBack = 5;
 static constexpr int kFwd = 5;
 static constexpr int kSnapEvery = 4;
 static constexpr int kMargin = 2;
-static constexpr int kHorizon = 30;
-static constexpr int kMinHorizon = 8;
+static constexpr int kHorizon = 60;     // frames máximos a simular tras el click
+static constexpr int kMinHorizon = 20;  // mínimo, aunque el siguiente click esté cerca
 static constexpr int kMaxPending = 8;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
-static constexpr float kStepDt = 1.001f / 240.f;
+static constexpr float kStepDt = 0.9999f / 240.f;
 // false: si la simulación se desvía de la realidad, se registra pero el click se cuenta igual
 static constexpr bool kStrictDrift = false;
 
@@ -106,6 +106,16 @@ static std::vector<Input> buildInputs(const Pending& p, int d) {
     return out;
 }
 
+// Estado del botón justo antes de ejecutar el frame "frame"
+static bool heldAt(int frame) {
+    bool held = false;
+    for (auto& in : g_log) {
+        if (in.frame >= frame) break;
+        held = in.down;
+    }
+    return held;
+}
+
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
@@ -120,6 +130,7 @@ class $modify(FrameBase, GJBaseGameLayer) {
                 g_probeTick++;
             } else {
                 g_frame++;
+                // La posición se guarda DESPUÉS del paso, con el frame ya avanzado.
                 if (m_player1) {
                     g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
                     while (g_posLog.size() > 600) g_posLog.pop_front();
@@ -134,6 +145,7 @@ class $modify(FrameBase, GJBaseGameLayer) {
         if (!PlayLayer::get() || !isPlayer1 || button != 1) return;
 
         g_log.push_back({g_frame, down});
+        if (g_log.size() > 400) g_log.erase(g_log.begin());
         if (!down) return;
         g_dbg[5]++;
 
@@ -192,6 +204,10 @@ class $modify(FrameLayer, PlayLayer) {
         g_probing = true;
         g_probeDead = false;
         g_probeInvalid = false;
+
+        // El checkpoint puede no guardar si el botón estaba pulsado
+        if (heldAt(p.baseFrame)) this->handleButton(true, 1, true);
+
         size_t k = 0;
         for (int t = p.baseFrame; t < p.endFrame && !g_probeDead && !g_probeInvalid; t++) {
             while (k < inputs.size() && inputs[k].frame <= t) {
@@ -382,6 +398,8 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // El final de la ventana se recorta al siguiente click para que un click
+        // posterior (que no se desplaza) no haga morir la simulación por error.
         for (size_t i = 0; i < g_waiting.size();) {
             if (g_frame >= g_waiting[i].clickFrame + kHorizon) {
                 auto& o = g_waiting[i];
