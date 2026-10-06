@@ -66,7 +66,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto winSize = CCDirector::get()->getWinSize();
 
         auto fl = CCLabelBMFont::create("Frame: 0", "bigFont.fnt");
-        fl->setScale(0.3f);
+        fl->setScale(0.45f);
         fl->setAnchorPoint({0.f, 1.f});
         fl->setPosition({8.f, winSize.height - 6.f});
         fl->setZOrder(100);
@@ -76,9 +76,9 @@ class $modify(FrameLayer, PlayLayer) {
         for (int i = 0; i < 7; i++) {
             std::string s = fmt::format("{}: 0", g_names[i]);
             auto row = CCLabelBMFont::create(s.data(), "bigFont.fnt");
-            row->setScale(0.35f);
+            row->setScale(0.6f);
             row->setAnchorPoint({0.f, 1.f});
-            row->setPosition({8.f, winSize.height - 22.f - i * 14.f});
+            row->setPosition({8.f, winSize.height - 30.f - i * 24.f});
             row->setColor(g_colors[i]);
             row->setZOrder(100);
             parent->addChild(row);
