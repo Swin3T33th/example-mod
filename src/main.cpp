@@ -7,9 +7,9 @@ using namespace geode::prelude;
 static int g_frame = 0;
 
 class $modify(FrameBase, GJBaseGameLayer) {
-    void processCommands(float dt) {
-        GJBaseGameLayer::processCommands(dt);
-        if (PlayLayer::get()) g_frame++;
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        if (PlayLayer::get() && !isHalfTick) g_frame++;
     }
 };
 
