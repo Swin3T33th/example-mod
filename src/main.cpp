@@ -65,4 +65,11 @@ class $modify(FrameLayer, PlayLayer) {
             }
             text += fmt::format("\nTotal: {}", g_clicks.size());
         }
-        m_fields->label->setString(text.c_
+        m_fields->label->setString(text.data());
+    }
+
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        resetCounters();
+    }
+};
