@@ -4,6 +4,7 @@
 #include <Geode/modify/EffectGameObject.hpp>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <deque>
 #include <vector>
 
@@ -19,11 +20,12 @@ static constexpr int kMargin = 2;
 static constexpr int kHorizon = 30;
 static constexpr int kTrigGuard = 120;
 static constexpr int kNoClick = 1000;
+static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 1.001f / 240.f;
 
 static int g_frame = 0;
 static std::array<int, 7> g_counts = {0, 0, 0, 0, 0, 0, 0};
-static std::array<int, 7> g_dbg = {0, 0, 0, 0, 0, 0, 0};
+static std::array<int, 8> g_dbg = {0, 0, 0, 0, 0, 0, 0, 0};
 static int g_lastAdv = 1;
 
 static const char* g_names[7] = {"9+:", "7-8:", "5-6:", "4:", "3:", "2:", "1:"};
@@ -46,8 +48,10 @@ struct Input { int frame; bool down; };
 struct Snap { int frame; CheckpointObject* cp; };
 struct Open { CheckpointObject* base = nullptr; int baseFrame = 0; int clickFrame = -1; };
 struct Pending { CheckpointObject* base; int baseFrame; int clickFrame; int endFrame; };
+struct Pos { int frame; float x; float y; };
 
 static std::deque<Snap> g_ring;
+static std::deque<Pos> g_posLog;
 static std::vector<Input> g_log;
 static std::vector<Open> g_waiting;
 static std::vector<Pending> g_pending;
@@ -66,6 +70,7 @@ static void clearProbeState() {
     g_pending.clear();
     g_log.clear();
     g_trigFrames.clear();
+    g_posLog.clear();
 }
 
 static void pushSnap(PlayLayer* pl) {
@@ -115,7 +120,13 @@ class $modify(FrameTrigger, EffectGameObject) {
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
-        if (pl && !isHalfTick && !g_probing && g_frame % kSnapEvery == 0) pushSnap(pl);
+        if (pl && !isHalfTick && !g_probing) {
+            if (m_player1) {
+                g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
+                while (g_posLog.size() > 600) g_posLog.pop_front();
+            }
+            if (g_frame % kSnapEvery == 0) pushSnap(pl);
+        }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
@@ -195,7 +206,22 @@ class $modify(FrameLayer, PlayLayer) {
         }
         g_probing = false;
         if (g_probeInvalid) return -1;
-        return g_probeDead ? 0 : 1;
+        if (g_probeDead) return 0;
+
+        if (d == 0) {
+            bool found = false;
+            for (auto it = g_posLog.rbegin(); it != g_posLog.rend(); ++it) {
+                if (it->frame == p.endFrame) {
+                    found = true;
+                    float dx = std::fabs(m_player1->getPositionX() - it->x);
+                    float dy = std::fabs(m_player1->getPositionY() - it->y);
+                    if (dx > kPosTol || dy > kPosTol) return -2;
+                    break;
+                }
+            }
+            if (!found) return -1;
+        }
+        return 1;
     }
 
     int probeWindow(const Pending& p) {
@@ -219,6 +245,9 @@ class $modify(FrameLayer, PlayLayer) {
         int r0 = survives(p, 0);
         if (r0 == -1) {
             g_dbg[4]++;
+        } else if (r0 == -2) {
+            g_dbg[7]++;
+            log::info("Click f{}: la simulación se desvía de la realidad, descartado", p.clickFrame);
         } else if (r0 == 0) {
             g_dbg[3]++;
             log::warn("Sondeo: d=0 murió; click en frame {} descartado", p.clickFrame);
@@ -387,8 +416,8 @@ class $modify(FrameLayer, PlayLayer) {
             m_fields->frameLabel->setString(s.data());
         }
         if (m_fields->dbgLabel) {
-            std::string s = fmt::format("clk {} son {} ok {}\nsc {} d0 {} pas {} trg {} adv {}",
-                g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[6], g_lastAdv);
+            std::string s = fmt::format("clk {} son {} ok {}\nsc {} d0 {} pas {} trg {} dev {} adv {}",
+                g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[6], g_dbg[7], g_lastAdv);
             m_fields->dbgLabel->setString(s.data());
         }
         for (int i = 0; i < 7; i++) {
