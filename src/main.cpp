@@ -1,7 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/EffectGameObject.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -18,7 +17,8 @@ static constexpr int kFwd = 5;
 static constexpr int kSnapEvery = 4;
 static constexpr int kMargin = 2;
 static constexpr int kHorizon = 30;
-static constexpr int kTrigGuard = 120;
+static constexpr int kMinHorizon = 8;
+static constexpr int kMaxPending = 8;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 1.001f / 240.f;
@@ -55,7 +55,6 @@ static std::deque<Pos> g_posLog;
 static std::vector<Input> g_log;
 static std::vector<Open> g_waiting;
 static std::vector<Pending> g_pending;
-static std::vector<int> g_trigFrames;
 static bool g_probing = false;
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
@@ -69,7 +68,6 @@ static void clearProbeState() {
     for (auto& p : g_pending) p.base->release();
     g_pending.clear();
     g_log.clear();
-    g_trigFrames.clear();
     g_posLog.clear();
 }
 
@@ -106,33 +104,26 @@ static std::vector<Input> buildInputs(const Pending& p, int d) {
     return out;
 }
 
-class $modify(FrameTrigger, EffectGameObject) {
-    void triggerObject(GJBaseGameLayer* layer, int p1, gd::vector<int> const* p2) {
-        if (g_probing) return;
-        if (PlayLayer::get()) {
-            g_trigFrames.push_back(g_frame);
-            if (g_trigFrames.size() > 256) g_trigFrames.erase(g_trigFrames.begin());
-        }
-        EffectGameObject::triggerObject(layer, p1, p2);
-    }
-};
-
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
         if (pl && !isHalfTick && !g_probing) {
-            if (m_player1) {
-                g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
-                while (g_posLog.size() > 600) g_posLog.pop_front();
-            }
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         if (pl && !isHalfTick) {
-            if (g_probing) g_probeTick++;
-            else g_frame++;
+            if (g_probing) {
+                g_probeTick++;
+            } else {
+                g_frame++;
+                // La posición se guarda DESPUÉS del paso, con el frame ya avanzado.
+                if (m_player1) {
+                    g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
+                    while (g_posLog.size() > 600) g_posLog.pop_front();
+                }
+            }
         }
     }
 
@@ -170,19 +161,20 @@ class $modify(FrameLayer, PlayLayer) {
         int savedFrame = 0;
     };
 
-    void resetCounters() {
+    void resetFrameState() {
         g_frame = 0;
-        g_counts.fill(0);
         clearProbeState();
     }
 
     bool stepFrame() {
         int before = g_probeTick;
-        GJBaseGameLayer::update(kStepDt);
+        // Si tu versión de Geode no tiene m_timeWarp, usa: float dt = kStepDt;
+        float dt = kStepDt / std::max(0.01f, m_gameState.m_timeWarp);
+        GJBaseGameLayer::update(dt);
         int advanced = g_probeTick - before;
         g_lastAdv = advanced;
         if (advanced != 1) {
-            log::warn("Sondeo: update({}) avanzó {} frames (se esperaba 1)", kStepDt, advanced);
+            log::warn("Sondeo: update({}) avanzó {} frames (se esperaba 1)", dt, advanced);
             g_probeInvalid = true;
             return false;
         }
@@ -225,14 +217,6 @@ class $modify(FrameLayer, PlayLayer) {
     }
 
     int probeWindow(const Pending& p) {
-        for (int f : g_trigFrames) {
-            if (f >= p.baseFrame - kTrigGuard && f < p.endFrame) {
-                g_dbg[6]++;
-                log::info("Click f{}: hay un trigger cerca, descartado", p.clickFrame);
-                return -1;
-            }
-        }
-
         auto live = this->createCheckpoint();
         if (!live) return -1;
         live->retain();
@@ -303,7 +287,8 @@ class $modify(FrameLayer, PlayLayer) {
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        resetCounters();
+        resetFrameState();
+        g_counts.fill(0);   // los contadores solo se reinician al entrar al nivel
         g_dbg.fill(0);
 
         CCNode* parent = this;
@@ -389,10 +374,20 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // El final de la ventana se recorta al siguiente click para que un click
+        // posterior (que no se desplaza) no haga morir la simulación por error.
         for (size_t i = 0; i < g_waiting.size();) {
             if (g_frame >= g_waiting[i].clickFrame + kHorizon) {
                 auto& o = g_waiting[i];
-                g_pending.push_back({o.base, o.baseFrame, o.clickFrame, o.clickFrame + kHorizon});
+                int end = o.clickFrame + kHorizon;
+                for (auto& in : g_log) {
+                    if (in.down && in.frame > o.clickFrame) {
+                        end = std::min(end, in.frame);
+                        break;
+                    }
+                }
+                end = std::max(end, o.clickFrame + kMinHorizon);
+                g_pending.push_back({o.base, o.baseFrame, o.clickFrame, end});
                 g_waiting.erase(g_waiting.begin() + i);
             } else {
                 i++;
@@ -400,7 +395,7 @@ class $modify(FrameLayer, PlayLayer) {
         }
 
         if (!g_pending.empty()) {
-            while (g_pending.size() > 2) {
+            while (g_pending.size() > static_cast<size_t>(kMaxPending)) {
                 g_pending.front().base->release();
                 g_pending.erase(g_pending.begin());
             }
@@ -416,8 +411,8 @@ class $modify(FrameLayer, PlayLayer) {
             m_fields->frameLabel->setString(s.data());
         }
         if (m_fields->dbgLabel) {
-            std::string s = fmt::format("clk {} son {} ok {}\nsc {} d0 {} pas {} trg {} dev {} adv {}",
-                g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[6], g_dbg[7], g_lastAdv);
+            std::string s = fmt::format("clk {} son {} ok {}\nsc {} d0 {} pas {} dev {} adv {}",
+                g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[7], g_lastAdv);
             m_fields->dbgLabel->setString(s.data());
         }
         for (int i = 0; i < 7; i++) {
@@ -430,7 +425,7 @@ class $modify(FrameLayer, PlayLayer) {
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        resetCounters();
+        resetFrameState();   // el contador se conserva entre intentos
     }
 
     void onQuit() {
