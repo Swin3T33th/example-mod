@@ -11,9 +11,12 @@ using namespace geode::prelude;
 static constexpr float kScale = 0.6f;
 static constexpr float kPad = 10.f;
 
-static constexpr int kBack = 8;
-static constexpr int kFwd = 8;
+static constexpr int kBack = 5;
+static constexpr int kFwd = 5;
+static constexpr int kSnapEvery = 4;
 static constexpr int kMargin = 2;
+static constexpr int kHorizon = 30;
+static constexpr int kNoClick = 1000;
 static constexpr float kStepDt = 1.f / 240.f;
 
 static int g_frame = 0;
@@ -42,7 +45,7 @@ struct Pending { CheckpointObject* base; int baseFrame; int clickFrame; int endF
 
 static std::deque<Snap> g_ring;
 static std::vector<Input> g_log;
-static Open g_open;
+static std::vector<Open> g_waiting;
 static std::vector<Pending> g_pending;
 static bool g_probing = false;
 static bool g_probeDead = false;
@@ -52,8 +55,8 @@ static int g_probeTick = 0;
 static void clearProbeState() {
     for (auto& s : g_ring) s.cp->release();
     g_ring.clear();
-    if (g_open.base) g_open.base->release();
-    g_open = Open{};
+    for (auto& o : g_waiting) o.base->release();
+    g_waiting.clear();
     for (auto& p : g_pending) p.base->release();
     g_pending.clear();
     g_log.clear();
@@ -64,7 +67,7 @@ static void pushSnap(PlayLayer* pl) {
     if (!cp) return;
     cp->retain();
     g_ring.push_back({g_frame, cp});
-    while (g_ring.size() > static_cast<size_t>(kBack) + 1) {
+    while (g_ring.size() > static_cast<size_t>(kBack / kSnapEvery + 2)) {
         g_ring.front().cp->release();
         g_ring.pop_front();
     }
@@ -80,8 +83,13 @@ static std::vector<Input> buildInputs(const Pending& p, int d) {
         if (dn < 0 && out[i].down && out[i].frame == p.clickFrame) dn = i;
         else if (dn >= 0 && up < 0 && !out[i].down) up = i;
     }
-    if (dn >= 0) out[dn].frame += d;
-    if (up >= 0) out[up].frame += d;
+    if (d == kNoClick) {
+        if (up >= 0) out.erase(out.begin() + up);
+        if (dn >= 0) out.erase(out.begin() + dn);
+    } else {
+        if (dn >= 0) out[dn].frame += d;
+        if (up >= 0) out[up].frame += d;
+    }
     std::stable_sort(out.begin(), out.end(),
         [](const Input& a, const Input& b) { return a.frame < b.frame; });
     return out;
@@ -90,7 +98,7 @@ static std::vector<Input> buildInputs(const Pending& p, int d) {
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
-        if (pl && !isHalfTick && !g_probing) pushSnap(pl);
+        if (pl && !isHalfTick && !g_probing && g_frame % kSnapEvery == 0) pushSnap(pl);
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
@@ -108,15 +116,18 @@ class $modify(FrameBase, GJBaseGameLayer) {
         g_log.push_back({g_frame, down});
         if (!down) return;
 
-        if (g_open.base) {
-            g_pending.push_back({g_open.base, g_open.baseFrame, g_open.clickFrame, g_frame});
+        Snap* best = nullptr;
+        for (auto& s : g_ring) {
+            if (s.frame <= g_frame - kBack) best = &s;
         }
-        if (!g_ring.empty()) {
-            auto& s = g_ring.front();
-            s.cp->retain();
-            g_open = Open{s.cp, s.frame, g_frame};
-        } else {
-            g_open = Open{};
+        if (!best && !g_ring.empty()) best = &g_ring.front();
+        if (!best) return;
+
+        best->cp->retain();
+        g_waiting.push_back(Open{best->cp, best->frame, g_frame});
+        if (g_waiting.size() > 16) {
+            g_waiting.front().base->release();
+            g_waiting.erase(g_waiting.begin());
         }
     }
 };
@@ -160,6 +171,7 @@ class $modify(FrameLayer, PlayLayer) {
                 k++;
             }
             if (!stepFrame()) break;
+            if (m_player1 && m_player1->m_isDead) g_probeDead = true;
         }
         g_probing = false;
         if (g_probeInvalid) return -1;
@@ -177,14 +189,20 @@ class $modify(FrameLayer, PlayLayer) {
         int w = -1;
         int r0 = survives(p, 0);
         if (r0 == 1) {
-            w = 1;
-            for (int d = -1; d >= dMin; d--) {
-                if (survives(p, d) != 1) break;
-                w++;
-            }
-            for (int d = 1; d <= dMax; d++) {
-                if (survives(p, d) != 1) break;
-                w++;
+            int rNo = survives(p, kNoClick);
+            if (rNo == 1) {
+                log::info("Click f{}: no hace falta (sobrevive sin click), descartado", p.clickFrame);
+            } else {
+                w = 1;
+                for (int d = -1; d >= dMin; d--) {
+                    if (survives(p, d) != 1) break;
+                    w++;
+                }
+                for (int d = 1; d <= dMax; d++) {
+                    if (survives(p, d) != 1) break;
+                    w++;
+                }
+                log::info("Click f{}: ventana {}", p.clickFrame, w);
             }
         } else {
             log::warn("Sondeo: d=0 dio {} (esperaba 1); click en frame {} descartado", r0, p.clickFrame);
@@ -279,11 +297,13 @@ class $modify(FrameLayer, PlayLayer) {
         menu->setPosition({0.f, 0.f});
         menu->setZOrder(100);
         auto saveBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Guardar"), this, menu_selector(FrameLayer::onSave));
+            ButtonSprite::create("Guardar", 80, true, "bigFont.fnt", "GJ_button_01.png", 50.f, 0.35f),
+            this, menu_selector(FrameLayer::onSave));
         auto restoreBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Restaurar"), this, menu_selector(FrameLayer::onRestore));
-        saveBtn->setPosition({winSize.width - 70.f, winSize.height - 40.f});
-        restoreBtn->setPosition({winSize.width - 70.f, winSize.height - 80.f});
+            ButtonSprite::create("Restaurar", 80, true, "bigFont.fnt", "GJ_button_01.png", 50.f, 0.35f),
+            this, menu_selector(FrameLayer::onRestore));
+        saveBtn->setPosition({winSize.width / 2.f - 48.f, 35.f});
+        restoreBtn->setPosition({winSize.width / 2.f + 48.f, 35.f});
         menu->addChild(saveBtn);
         menu->addChild(restoreBtn);
         parent->addChild(menu);
@@ -294,14 +314,26 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
-        if (!g_pending.empty()) {
-            auto list = std::move(g_pending);
-            g_pending.clear();
-            for (auto& p : list) {
-                int w = probeWindow(p);
-                if (w > 0) g_counts[rowForWidth(w)]++;
-                p.base->release();
+        for (size_t i = 0; i < g_waiting.size();) {
+            if (g_frame >= g_waiting[i].clickFrame + kHorizon) {
+                auto& o = g_waiting[i];
+                g_pending.push_back({o.base, o.baseFrame, o.clickFrame, o.clickFrame + kHorizon});
+                g_waiting.erase(g_waiting.begin() + i);
+            } else {
+                i++;
             }
+        }
+
+        if (!g_pending.empty()) {
+            while (g_pending.size() > 2) {
+                g_pending.front().base->release();
+                g_pending.erase(g_pending.begin());
+            }
+            Pending p = g_pending.front();
+            g_pending.erase(g_pending.begin());
+            int w = probeWindow(p);
+            if (w > 0) g_counts[rowForWidth(w)]++;
+            p.base->release();
         }
 
         if (m_fields->frameLabel) {
