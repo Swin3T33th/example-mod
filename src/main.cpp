@@ -22,6 +22,8 @@ static constexpr int kMaxPending = 8;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 1.001f / 240.f;
+// false: si la simulación se desvía de la realidad, se registra pero el click se cuenta igual
+static constexpr bool kStrictDrift = false;
 
 static int g_frame = 0;
 static std::array<int, 7> g_counts = {0, 0, 0, 0, 0, 0, 0};
@@ -118,7 +120,6 @@ class $modify(FrameBase, GJBaseGameLayer) {
                 g_probeTick++;
             } else {
                 g_frame++;
-                // La posición se guarda DESPUÉS del paso, con el frame ya avanzado.
                 if (m_player1) {
                     g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
                     while (g_posLog.size() > 600) g_posLog.pop_front();
@@ -167,11 +168,15 @@ class $modify(FrameLayer, PlayLayer) {
     }
 
     bool stepFrame() {
-        int before = g_probeTick;
         // Si tu versión de Geode no tiene m_timeWarp, usa: float dt = kStepDt;
         float dt = kStepDt / std::max(0.01f, m_gameState.m_timeWarp);
-        GJBaseGameLayer::update(dt);
-        int advanced = g_probeTick - before;
+        int advanced = 0;
+        // Reintenta si el resto de tiempo acumulado hizo que no avanzara ningún frame
+        for (int attempt = 0; attempt < 2 && advanced == 0; attempt++) {
+            int before = g_probeTick;
+            GJBaseGameLayer::update(dt);
+            advanced = g_probeTick - before;
+        }
         g_lastAdv = advanced;
         if (advanced != 1) {
             log::warn("Sondeo: update({}) avanzó {} frames (se esperaba 1)", dt, advanced);
@@ -207,7 +212,11 @@ class $modify(FrameLayer, PlayLayer) {
                     found = true;
                     float dx = std::fabs(m_player1->getPositionX() - it->x);
                     float dy = std::fabs(m_player1->getPositionY() - it->y);
-                    if (dx > kPosTol || dy > kPosTol) return -2;
+                    if (dx > kPosTol || dy > kPosTol) {
+                        g_dbg[7]++;
+                        log::info("Click f{}: desviación dx={} dy={}", p.clickFrame, dx, dy);
+                        if (kStrictDrift) return -2;
+                    }
                     break;
                 }
             }
@@ -230,7 +239,6 @@ class $modify(FrameLayer, PlayLayer) {
         if (r0 == -1) {
             g_dbg[4]++;
         } else if (r0 == -2) {
-            g_dbg[7]++;
             log::info("Click f{}: la simulación se desvía de la realidad, descartado", p.clickFrame);
         } else if (r0 == 0) {
             g_dbg[3]++;
@@ -288,7 +296,7 @@ class $modify(FrameLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         resetFrameState();
-        g_counts.fill(0);   // los contadores solo se reinician al entrar al nivel
+        g_counts.fill(0);
         g_dbg.fill(0);
 
         CCNode* parent = this;
@@ -374,8 +382,6 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
-        // El final de la ventana se recorta al siguiente click para que un click
-        // posterior (que no se desplaza) no haga morir la simulación por error.
         for (size_t i = 0; i < g_waiting.size();) {
             if (g_frame >= g_waiting[i].clickFrame + kHorizon) {
                 auto& o = g_waiting[i];
@@ -425,7 +431,7 @@ class $modify(FrameLayer, PlayLayer) {
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        resetFrameState();   // el contador se conserva entre intentos
+        resetFrameState();
     }
 
     void onQuit() {
