@@ -326,4 +326,3 @@ class $modify(FrameLayer, PlayLayer) {
         PlayLayer::onQuit();
     }
 };
-```
