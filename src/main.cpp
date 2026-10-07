@@ -236,6 +236,10 @@ class $modify(FrameTrigger, EffectGameObject) {
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
+        if (pl && !isHalfTick && !g_probing && m_player1) {
+            g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
+            while (g_posLog.size() > 600) g_posLog.pop_front();
+        }
         if (pl && pl->m_isPracticeMode && pl->m_player1 && !isHalfTick && !g_probing) {
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
@@ -243,15 +247,8 @@ class $modify(FrameBase, GJBaseGameLayer) {
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         if (pl && !isHalfTick) {
-            if (g_probing) {
-                g_probeTick++;
-            } else {
-                g_frame++;
-                if (m_player1) {
-                    g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
-                    while (g_posLog.size() > 600) g_posLog.pop_front();
-                }
-            }
+            if (g_probing) g_probeTick++;
+            else g_frame++;
         }
     }
 
@@ -457,6 +454,10 @@ class $modify(FrameLayer, PlayLayer) {
         g_diagEffect = -1.f;
         g_restDx = -1.f;
         g_restDy = -1.f;
+        g_diagDx = 0.f;
+        g_diagDy = 0.f;
+        g_diagXsim = 0.f;
+        g_diagXreal = 0.f;
         g_hudDirty = true;
 
         CCNode* parent = this;
