@@ -27,7 +27,9 @@ static constexpr int kChainSpan = 30;     // si hay otro click antes de esto, el
 static constexpr size_t kMaxPending = 30;
 static constexpr int kNoClick = 1000;
 static constexpr int kNever = 0x7fffffff;
-static constexpr float kPosTol = 0.1f;
+static constexpr bool kConfirm = false;   // true: cada fallo se repite una vez para confirmarlo
+static constexpr float kPosTol = 0.1f;    // calibracion del desfase del checkpoint
+static constexpr float kDriftTol = 0.1f;  // tolerancia del descarte "dev" (sube a 0.5f para probar con mas margen)
 static constexpr float kStepDt = 0.9999f / 240.f;
 static constexpr bool kStrictDrift = true;
 static constexpr bool kAnyTrigger = false;
@@ -37,9 +39,10 @@ static constexpr bool kDebug = true;
 static constexpr bool kDisableIfXdbot = false;
 static constexpr bool kUsePlayLayerUpdate = false;
 
-// Convergencia: frames seguidos con la misma posicion que la real para dar el sondeo por superado
+// Convergencia: frames seguidos con la misma posicion y velocidad que la real para dar el sondeo por superado
 static constexpr int kConvFrames = 5;
 static constexpr float kConvTol = 0.01f;
+static constexpr float kConvVelTol = 0.05f;
 
 // Desfase de la carga del checkpoint: frames maximos que se buscan hacia atras
 static constexpr int kLagMax = 8;
@@ -124,7 +127,7 @@ static bool affectsGameplay(int id) {
 struct Input { int frame; bool down; };
 struct Snap { int frame; CheckpointObject* cp; };
 struct Open { CheckpointObject* base = nullptr; int baseFrame = 0; int clickFrame = -1; };
-struct Pos { int frame; float x; float y; };
+struct Pos { int frame; float x; float y; float vy = 0.f; };
 
 struct Pending {
     CheckpointObject* base = nullptr;
@@ -356,7 +359,8 @@ class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
         if (pl && !isHalfTick && !g_probing && m_player1) {
-            g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY()});
+            g_posLog.push_back({g_frame, m_player1->getPositionX(), m_player1->getPositionY(),
+                static_cast<float>(m_player1->m_yVelocity)});
             while (g_posLog.size() > kPosKeep) g_posLog.pop_front();
         }
         if (pl && pl->m_isPracticeMode && pl->m_player1 && !isHalfTick && !g_probing) {
@@ -364,7 +368,8 @@ class $modify(FrameBase, GJBaseGameLayer) {
         }
         if (pl && !isHalfTick && g_probing && m_player1) {
             g_simLog.push_back({g_probeBase + (g_probeTick - g_probeTick0),
-                m_player1->getPositionX(), m_player1->getPositionY()});
+                m_player1->getPositionX(), m_player1->getPositionY(),
+                static_cast<float>(m_player1->m_yVelocity)});
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -571,12 +576,13 @@ class $modify(FrameLayer, PlayLayer) {
             if (g_probeDead) { deathT = t; break; }
 
             // Salida temprana: ya no quedan diferencias de input y la simulacion
-            // iguala la trayectoria real durante kConvFrames frames seguidos
+            // iguala posicion Y velocidad de la trayectoria real durante kConvFrames frames seguidos
             if (t >= lastDiff && m_player1) {
                 auto rp = posAt(t + 1);
                 if (rp &&
                     std::fabs(m_player1->getPositionX() - rp->x) <= kConvTol &&
-                    std::fabs(m_player1->getPositionY() - rp->y) <= kConvTol) {
+                    std::fabs(m_player1->getPositionY() - rp->y) <= kConvTol &&
+                    std::fabs(static_cast<float>(m_player1->m_yVelocity) - rp->vy) <= kConvVelTol) {
                     if (++conv >= kConvFrames) { converged = true; break; }
                 } else {
                     conv = 0;
@@ -601,7 +607,7 @@ class $modify(FrameLayer, PlayLayer) {
                 if (!rp) continue;
                 float dx = std::fabs(g_simLog[i].x - rp->x);
                 float dy = std::fabs(g_simLog[i].y - rp->y);
-                if (dx > kPosTol || dy > kPosTol) {
+                if (dx > kDriftTol || dy > kDriftTol) {
                     g_diagStep = static_cast<int>(i);
                     g_diagDx = dx;
                     g_diagDy = dy;
@@ -697,7 +703,7 @@ class $modify(FrameLayer, PlayLayer) {
                 return false;
             }
             case 2: {
-                // Hacia atras desde d = -1; cada fallo se confirma repitiendolo
+                // Hacia atras desde d = -1; con kConfirm cada fallo se repite una vez
                 if (p.d < p.dMin) {
                     p.cutBack = true;
                     p.d = 1;
@@ -712,7 +718,7 @@ class $modify(FrameLayer, PlayLayer) {
                     p.d--;
                     return false;
                 }
-                if (!p.confirm) { p.confirm = true; return false; }
+                if (kConfirm && !p.confirm) { p.confirm = true; return false; }
                 p.confirm = false;
                 p.res[p.d + 8] = 0;
                 p.dead[p.d + 8] = static_cast<short>(g_lastDeathRel);
@@ -721,7 +727,7 @@ class $modify(FrameLayer, PlayLayer) {
                 return false;
             }
             default: {
-                // Hacia delante desde d = 1; cada fallo se confirma repitiendolo
+                // Hacia delante desde d = 1; con kConfirm cada fallo se repite una vez
                 if (p.d > p.dMax) {
                     p.cutFwd = true;
                     return finishJob(p);
@@ -734,7 +740,7 @@ class $modify(FrameLayer, PlayLayer) {
                     p.d++;
                     return false;
                 }
-                if (!p.confirm) { p.confirm = true; return false; }
+                if (kConfirm && !p.confirm) { p.confirm = true; return false; }
                 p.confirm = false;
                 p.res[p.d + 8] = 0;
                 p.dead[p.d + 8] = static_cast<short>(g_lastDeathRel);
@@ -856,7 +862,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v17", g_frame);
+            std::string s = fmt::format("Frame: {} v18", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
