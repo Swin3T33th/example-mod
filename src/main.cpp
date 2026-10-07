@@ -130,6 +130,9 @@ static int g_probeBase = 0;
 static int g_probeTick0 = 0;
 static float g_diagMovReal = 0.f;
 static float g_diagMovSim = 0.f;
+static float g_restX = 0.f;
+static float g_sim0X = 0.f;
+static float g_real0X = 0.f;
 
 static void clearProbeState() {
     for (auto& s : g_ring) s.cp->release();
@@ -334,6 +337,7 @@ class $modify(FrameLayer, PlayLayer) {
             if (auto bp = posAt(p.baseFrame)) {
                 g_restDx = std::fabs(m_player1->getPositionX() - bp->x);
                 g_restDy = std::fabs(m_player1->getPositionY() - bp->y);
+                g_restX = m_player1->getPositionX();
             }
         }
 
@@ -384,6 +388,10 @@ class $modify(FrameLayer, PlayLayer) {
                     bad = true;
                     break;
                 }
+            }
+            if (!g_simLog.empty()) {
+                g_sim0X = g_simLog[0].x;
+                if (auto r = posAt(g_simLog[0].frame)) g_real0X = r->x;
             }
             if (kDebug && g_simLog.size() > 1) {
                 auto r0 = posAt(g_simLog[0].frame);
@@ -475,6 +483,9 @@ class $modify(FrameLayer, PlayLayer) {
         g_diagXreal = 0.f;
         g_diagMovReal = 0.f;
         g_diagMovSim = 0.f;
+        g_restX = 0.f;
+        g_sim0X = 0.f;
+        g_real0X = 0.f;
         g_hudDirty = true;
 
         CCNode* parent = this;
@@ -571,7 +582,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v6", g_frame);
+            std::string s = fmt::format("Frame: {} v7", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
@@ -594,9 +605,10 @@ class $modify(FrameLayer, PlayLayer) {
         }
         if (kDebug && f->diagLabel) {
             std::string s = fmt::format(
-                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}",
+                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}\nrest x {:.1f} sim0 {:.1f} real0 {:.1f}",
                 g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal,
-                g_diagMovReal, g_diagMovSim, g_lastAdv, g_tw, g_restDx, g_restDy);
+                g_diagMovReal, g_diagMovSim, g_lastAdv, g_tw, g_restDx, g_restDy,
+                g_restX, g_sim0X, g_real0X);
             f->diagLabel->setString(s.c_str());
         }
     }
