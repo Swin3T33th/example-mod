@@ -22,12 +22,14 @@ static constexpr int kMargin = 2;
 static constexpr int kHorizon = 60;
 static constexpr int kMinHorizon = 20;
 static constexpr int kCap = 9;
-static constexpr size_t kMaxPending = 6;
+static constexpr size_t kMaxPending = 10;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 0.9999f / 240.f;
-static constexpr bool kStrictDrift = false;
+static constexpr bool kStrictDrift = true;   // true: descarta mediciones que no coinciden con la realidad
 static constexpr bool kAnyTrigger = false;
+static constexpr int kTrigLookback = 480;    // frames previos que se vigilan por triggers en marcha
+static constexpr int kTrigKeep = 1500;
 static constexpr bool kDebug = true;
 static constexpr bool kDisableIfXdbot = false; // true: no sondea si xdBot está cargado
 
@@ -68,16 +70,20 @@ static int rowForWidth(int w) {
     return 6;
 }
 
+// Triggers que pueden cambiar la colisión o la trayectoria (IDs de memoria)
 static bool affectsGameplay(int id) {
     if (kAnyTrigger) return true;
     switch (id) {
-        case 901:
-        case 1346:
-        case 2067:
-        case 1347:
-        case 1814:
-        case 1049:
-        case 1268:
+        case 901:   // move
+        case 1346:  // rotate
+        case 2067:  // scale
+        case 1347:  // follow
+        case 1814:  // follow player Y
+        case 1049:  // toggle
+        case 1268:  // spawn
+        case 1616:  // stop
+        case 1912:  // random
+        case 2068:  // advanced random
             return true;
         default:
             return false;
@@ -191,10 +197,11 @@ static std::vector<Input> shiftedInputs(const Pending& p, int d) {
 
 class $modify(FrameTrigger, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int p1, gd::vector<int> const* p2) {
+        // Durante el sondeo NUNCA se ejecuta un trigger: no puede tocar el nivel real
         if (g_probing) return;
         if (PlayLayer::get() && affectsGameplay(m_objectID)) {
             g_trigFrames.push_back(g_frame);
-            while (!g_trigFrames.empty() && g_trigFrames.front() < g_frame - 600) {
+            while (!g_trigFrames.empty() && g_trigFrames.front() < g_frame - kTrigKeep) {
                 g_trigFrames.pop_front();
             }
         }
@@ -205,7 +212,8 @@ class $modify(FrameTrigger, EffectGameObject) {
 class $modify(FrameBase, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
-        if (pl && !isHalfTick && !g_probing) {
+        // Solo se toman capturas en modo práctica y con el jugador ya cargado
+        if (pl && pl->m_isPracticeMode && pl->m_player1 && !isHalfTick && !g_probing) {
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
 
@@ -288,6 +296,7 @@ class $modify(FrameLayer, PlayLayer) {
         return true;
     }
 
+    // 1 sobrevive, 0 muere, -1 inválido, -2 desviado (solo con kStrictDrift)
     int survives(const Pending& p, int d) {
         this->loadFromCheckpoint(p.base);
         auto inputs = shiftedInputs(p, d);
@@ -329,6 +338,7 @@ class $modify(FrameLayer, PlayLayer) {
         g_own = false;
         if (g_probeInvalid) return -1;
         if (g_probeDead) return 0;
+        if (!m_player1) return -1;
 
         float ex = m_player1->getPositionX();
         g_endY = m_player1->getPositionY();
@@ -348,6 +358,7 @@ class $modify(FrameLayer, PlayLayer) {
         return 1;
     }
 
+    // Avanza un paso del sondeo de un click. Devuelve true cuando ya está resuelto.
     bool advanceJob(Pending& p) {
         g_hudDirty = true;
         switch (p.stage) {
@@ -460,19 +471,22 @@ class $modify(FrameLayer, PlayLayer) {
         return true;
     }
 
+    // Convierte los clicks "esperando" en trabajos pendientes cuando ya pasó su horizonte
     void promoteWaiting() {
         for (size_t i = 0; i < g_waiting.size();) {
             Open o = g_waiting[i];
             if (g_frame < o.clickFrame + kHorizon) { i++; continue; }
             g_waiting.erase(g_waiting.begin() + i);
 
+            // El final se recorta al siguiente click (que no se desplaza)
             int end = o.clickFrame + kHorizon;
             for (size_t j = logLowerBound(o.clickFrame + 1); j < g_log.size(); j++) {
                 if (g_log[j].down) { end = std::min(end, g_log[j].frame); break; }
             }
             end = std::max(end, o.clickFrame + kMinHorizon);
 
-            if (windowHasTrigger(o.baseFrame, end)) {
+            // Triggers en marcha o dentro de la ventana: la simulación no sería fiable
+            if (windowHasTrigger(o.baseFrame - kTrigLookback, end)) {
                 g_dbg[8]++;
                 g_hudDirty = true;
                 o.base->release();
@@ -527,6 +541,7 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // Durante el sondeo (o dentro de otra pasada) no se hace nada más
         if (g_probing || g_inPost) return;
         g_inPost = true;
 
@@ -535,6 +550,7 @@ class $modify(FrameLayer, PlayLayer) {
         if (!skip) promoteWaiting();
 
         if (!skip && !g_pending.empty() && m_isPracticeMode && m_player1 && !m_player1->m_isDead) {
+            // Si hay cola, se descartan los más viejos
             while (g_pending.size() > kMaxPending) {
                 g_pending.front().base->release();
                 g_pending.pop_front();
