@@ -32,18 +32,13 @@ static constexpr int kTrigLookback = 480;
 static constexpr int kTrigKeep = 1500;
 static constexpr bool kDebug = true;
 static constexpr bool kDisableIfXdbot = false;
-// true: fuerza la x del checkpoint justo al empezar el primer paso del sondeo
-static constexpr bool kPatchStartX = false;
-// true: antes de cada sondeo d==0 da 2 pasos seguidos y mide el avance en X de cada uno
-static constexpr bool kTwoStepDiag = false;
-
-// Paso de calentamiento tras cargar el checkpoint (no cuenta como frame del sondeo)
-// 0 = desactivado, 1 = automatico (detecta si hace falta), 2 = forzar siempre
-static constexpr int kWarmupMode = 1;
-// si el paso de calentamiento mueve la x menos que esto, se considera "gastado"
-static constexpr float kWarmupEps = 0.0001f;
 // true: usa PlayLayer::update en vez de GJBaseGameLayer::update para cada paso
 static constexpr bool kUsePlayLayerUpdate = false;
+
+// Desfase de la carga del checkpoint: frames maximos que se buscan hacia atras
+static constexpr int kLagMax = 8;
+// Sondeos entre recalibraciones del desfase
+static constexpr int kRecalEvery = 60;
 
 static constexpr float kBudgetMs = 10.f;
 static constexpr float kBudgetSlowMs = 3.f;
@@ -113,8 +108,7 @@ struct Pending {
     int baseFrame = 0;
     int clickFrame = 0;
     int endFrame = 0;
-    std::vector<Input> inputs;
-    bool heldAtBase = false;
+    std::vector<Input> inputs;   // desde baseFrame - kLagMax
     int dMin = 0;
     int dMax = 0;
     int stage = 0;               // 0 clic real, 1 sin clic, 2 barrido de desplazamientos
@@ -145,23 +139,10 @@ static float g_diagMovSim = 0.f;
 static float g_restX = 0.f;
 static float g_sim0X = 0.f;
 static float g_real0X = 0.f;
-static float g_patchX = 0.f;
-static float g_trX1 = 0.f;
-static float g_trX3 = 0.f;
-// diagnostico de dos pasos seguidos tras cargar el checkpoint
-static float g_dx1 = -99.f;
-static float g_dx2 = -99.f;
-static float g_dy1 = -99.f;
-static float g_dy2 = -99.f;
-// calentamiento: 0 desconocido, 1 hace falta, 2 no hace falta
-static int g_warm = 0;
-static float g_warmDx = -1.f;
-
-static int initialWarmState() {
-    if (kWarmupMode == 0) return 2;
-    if (kWarmupMode == 2) return 1;
-    return 0;
-}
+// desfase de la carga del checkpoint (-1 = sin medir)
+static int g_lag = -1;
+static int g_lagAge = 0;
+static float g_lagErr = -1.f;
 
 static void clearProbeState() {
     for (auto& s : g_ring) s.cp->release();
@@ -190,6 +171,7 @@ static void pushSnap(PlayLayer* pl) {
     }
 }
 
+// Posicion real registrada ANTES de ejecutar el frame "frame"
 static const Pos* posAt(int frame) {
     if (g_posLog.empty()) return nullptr;
     int idx = frame - g_posLog.front().frame;
@@ -206,6 +188,12 @@ static size_t logLowerBound(int frame) {
         else hi = mid;
     }
     return lo;
+}
+
+// Estado del boton justo antes de ejecutar el frame "frame"
+static bool heldAtFrame(int frame) {
+    size_t lb = logLowerBound(frame);
+    return lb > 0 ? g_log[lb - 1].down : false;
 }
 
 static bool windowHasTrigger(int a, int b) {
@@ -282,7 +270,6 @@ class $modify(FrameBase, GJBaseGameLayer) {
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
         if (pl && !isHalfTick && g_probing && m_player1) {
-            if (kPatchStartX && g_simLog.empty()) m_player1->setPositionX(g_patchX);
             g_simLog.push_back({g_probeBase + (g_probeTick - g_probeTick0),
                 m_player1->getPositionX(), m_player1->getPositionY()});
         }
@@ -336,6 +323,8 @@ class $modify(FrameLayer, PlayLayer) {
 
     void resetFrameState() {
         g_frame = 0;
+        g_lag = -1;      // se vuelve a calibrar tras cada respawn
+        g_lagAge = 0;
         clearProbeState();
     }
 
@@ -360,12 +349,12 @@ class $modify(FrameLayer, PlayLayer) {
         return true;
     }
 
-    // Diagnostico opcional: 2 pasos seguidos tras cargar, midiendo X/Y de cada uno.
-    void diagTwoSteps(const Pending& p) {
+    // Mide cuantos frames "retrocede" la carga del checkpoint: da un paso, mira la x
+    // al empezar ese paso y busca a que frame real corresponde.
+    bool calibrateLag(const Pending& p) {
         this->loadFromCheckpoint(p.base);
-        if (!m_player1) return;
+        if (!m_player1) return false;
 
-        int savedInv = g_dbg[6];
         g_probing = true;
         g_probeDead = false;
         g_probeInvalid = false;
@@ -373,88 +362,66 @@ class $modify(FrameLayer, PlayLayer) {
         g_probeBase = p.baseFrame;
         g_probeTick0 = g_probeTick;
 
-        float x0 = m_player1->getPositionX();
-        float y0 = m_player1->getPositionY();
-        bool ok1 = stepFrame();
-        float x1 = m_player1->getPositionX();
-        float y1 = m_player1->getPositionY();
-        bool ok2 = ok1 && stepFrame();
-        float x2 = m_player1->getPositionX();
-        float y2 = m_player1->getPositionY();
-
+        bool ok = stepFrame();
         g_probing = false;
         g_own = false;
-        g_probeInvalid = false;
-        g_probeDead = false;
-        g_simLog.clear();
-        g_dbg[6] = savedInv;
+        if (!ok || g_simLog.empty()) {
+            g_simLog.clear();
+            return false;
+        }
 
-        g_dx1 = x1 - x0;
-        g_dx2 = ok2 ? (x2 - x1) : -99.f;
-        g_dy1 = y1 - y0;
-        g_dy2 = ok2 ? (y2 - y1) : -99.f;
-        log::info("diag 2 pasos: dx1 {:.3f} dx2 {:.3f} dy1 {:.3f} dy2 {:.3f}",
-            g_dx1, g_dx2, g_dy1, g_dy2);
+        float sx = g_simLog[0].x;
+        g_simLog.clear();
+
+        int best = -1;
+        float bestErr = 1e9f;
+        for (int k = 0; k <= kLagMax; k++) {
+            auto rp = posAt(p.baseFrame - k);
+            if (!rp) continue;
+            float e = std::fabs(sx - rp->x);
+            if (e < bestErr) { bestErr = e; best = k; }
+        }
+
+        g_lagAge = 0;
+        g_lagErr = bestErr;
+        g_lag = (best >= 0 && bestErr <= kPosTol) ? best : 0;
+        g_hudDirty = true;
+        return true;
     }
 
-    // Carga el checkpoint, prepara el estado de sondeo, aplica el boton mantenido
-    // y (si hace falta) da un paso de calentamiento descartado.
-    // Devuelve false si el sondeo queda invalido.
-    bool startProbe(const Pending& p) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-            this->loadFromCheckpoint(p.base);
-            if (!m_player1) return false;
-            g_patchX = m_player1->getPositionX();
-
-            g_probing = true;
-            g_probeDead = false;
-            g_probeInvalid = false;
-            g_simLog.clear();
-            g_probeBase = p.baseFrame;
-            g_probeTick0 = g_probeTick;
-
-            if (p.heldAtBase) {
-                g_own = true;
-                this->handleButton(true, 1, true);
-                g_own = false;
-            }
-
-            if (g_warm == 2) return true;   // no hace falta calentar
-
-            float x0 = m_player1->getPositionX();
-            bool ok = stepFrame();
-            float x1 = m_player1->getPositionX();
-            // el paso de calentamiento no cuenta como frame del sondeo
-            g_probeTick0 = g_probeTick;
-            g_simLog.clear();
-            if (!ok) return false;
-            if (m_player1->m_isDead) { g_probeDead = true; return true; }
-
-            float dx = std::fabs(x1 - x0);
-            g_warmDx = dx;
-            g_hudDirty = true;
-
-            if (g_warm == 1) return true;   // ya sabemos que hace falta
-
-            // desconocido: decidir
-            if (dx < kWarmupEps) {
-                g_warm = 1;                 // el primer paso no movia: era de calentamiento
-                return true;
-            }
-            // movio la x: era un paso real, hay que rehacer sin calentar
-            g_warm = 2;
-            g_probing = false;
+    // Carga el checkpoint y deja todo listo para sondear.
+    // t0 = frame real desde el que empieza el bucle (baseFrame - desfase).
+    bool startProbe(const Pending& p, int& t0) {
+        if (g_lag < 0 || g_lagAge >= kRecalEvery) {
+            if (!calibrateLag(p)) return false;
         }
-        return false;
+        g_lagAge++;
+        t0 = p.baseFrame - g_lag;
+
+        this->loadFromCheckpoint(p.base);
+        if (!m_player1) return false;
+
+        g_probing = true;
+        g_probeDead = false;
+        g_probeInvalid = false;
+        g_simLog.clear();
+        g_probeBase = t0;
+        g_probeTick0 = g_probeTick;
+
+        if (heldAtFrame(t0)) {
+            g_own = true;
+            this->handleButton(true, 1, true);
+            g_own = false;
+        }
+        return true;
     }
 
     // 1 sobrevive, 0 muere, -1 invalido, -2 desviado (solo con kStrictDrift)
     int survives(const Pending& p, int d) {
-        if (kDebug && kTwoStepDiag && d == 0) diagTwoSteps(p);
-
         auto inputs = shiftedInputs(p, d);
 
-        if (!startProbe(p)) {
+        int t0 = p.baseFrame;
+        if (!startProbe(p, t0)) {
             g_probing = false;
             g_own = false;
             return -1;
@@ -470,16 +437,16 @@ class $modify(FrameLayer, PlayLayer) {
         if (kDebug && d == 0) g_diagStep = -1;
 
         size_t k = 0;
-        for (int t = p.baseFrame; t < p.endFrame && !g_probeDead && !g_probeInvalid; t++) {
+        while (k < inputs.size() && inputs[k].frame < t0) k++;   // inputs anteriores al inicio
+
+        for (int t = t0; t < p.endFrame && !g_probeDead && !g_probeInvalid; t++) {
             while (k < inputs.size() && inputs[k].frame <= t) {
                 g_own = true;
                 this->handleButton(inputs[k].down, 1, true);
                 g_own = false;
                 k++;
             }
-            if (kDebug && d == 0 && t == p.baseFrame && m_player1) g_trX1 = m_player1->getPositionX();
             if (!stepFrame()) break;
-            if (kDebug && d == 0 && t == p.baseFrame && m_player1) g_trX3 = m_player1->getPositionX();
             if (m_player1 && m_player1->m_isDead) g_probeDead = true;
         }
         g_probing = false;
@@ -601,15 +568,7 @@ class $modify(FrameLayer, PlayLayer) {
         g_restX = 0.f;
         g_sim0X = 0.f;
         g_real0X = 0.f;
-        g_patchX = 0.f;
-        g_trX1 = 0.f;
-        g_trX3 = 0.f;
-        g_dx1 = -99.f;
-        g_dx2 = -99.f;
-        g_dy1 = -99.f;
-        g_dy2 = -99.f;
-        g_warm = initialWarmState();
-        g_warmDx = -1.f;
+        g_lagErr = -1.f;
         g_hudDirty = true;
 
         CCNode* parent = this;
@@ -691,8 +650,9 @@ class $modify(FrameLayer, PlayLayer) {
             p.clickFrame = o.clickFrame;
             p.endFrame = end;
             p.res.fill(-1);
-            size_t lb = logLowerBound(o.baseFrame);
-            p.heldAtBase = lb > 0 ? g_log[lb - 1].down : false;
+            // los inputs se recogen desde kLagMax frames antes de la base,
+            // porque el sondeo puede empezar hasta kLagMax frames antes
+            size_t lb = logLowerBound(o.baseFrame - kLagMax);
             for (size_t j = lb; j < g_log.size() && g_log[j].frame < end; j++) {
                 p.inputs.push_back(g_log[j]);
             }
@@ -706,7 +666,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v10", g_frame);
+            std::string s = fmt::format("Frame: {} v11", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
@@ -729,11 +689,10 @@ class $modify(FrameLayer, PlayLayer) {
         }
         if (kDebug && f->diagLabel) {
             std::string s = fmt::format(
-                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}\nrest x {:.1f} sim0 {:.1f} real0 {:.1f}\nx pre {:.1f} post {:.1f}\nwarm {} dx {:.4f}",
+                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}\nrest x {:.1f} sim0 {:.1f} real0 {:.1f}\nlag {} err {:.3f}",
                 g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal,
                 g_diagMovReal, g_diagMovSim, g_lastAdv, g_tw, g_restDx, g_restDy,
-                g_restX, g_sim0X, g_real0X, g_trX1, g_trX3,
-                g_warm, g_warmDx);
+                g_restX, g_sim0X, g_real0X, g_lag, g_lagErr);
             f->diagLabel->setString(s.c_str());
         }
     }
