@@ -125,6 +125,11 @@ static bool g_own = false;
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
 static int g_probeTick = 0;
+static std::vector<Pos> g_simLog;
+static int g_probeBase = 0;
+static int g_probeTick0 = 0;
+static float g_diagMovReal = 0.f;
+static float g_diagMovSim = 0.f;
 
 static void clearProbeState() {
     for (auto& s : g_ring) s.cp->release();
@@ -136,6 +141,7 @@ static void clearProbeState() {
     g_log.clear();
     g_posLog.clear();
     g_trigFrames.clear();
+    g_simLog.clear();
     g_probing = false;
     g_inPost = false;
     g_own = false;
@@ -243,6 +249,10 @@ class $modify(FrameBase, GJBaseGameLayer) {
         if (pl && pl->m_isPracticeMode && pl->m_player1 && !isHalfTick && !g_probing) {
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
+        if (pl && !isHalfTick && g_probing && m_player1) {
+            g_simLog.push_back({g_probeBase + (g_probeTick - g_probeTick0),
+                m_player1->getPositionX(), m_player1->getPositionY()});
+        }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
@@ -320,7 +330,6 @@ class $modify(FrameLayer, PlayLayer) {
     int survives(const Pending& p, int d) {
         this->loadFromCheckpoint(p.base);
 
-        // Desviacion justo tras restaurar, antes de simular nada
         if (kDebug && d == 0 && m_player1) {
             if (auto bp = posAt(p.baseFrame)) {
                 g_restDx = std::fabs(m_player1->getPositionX() - bp->x);
@@ -332,6 +341,9 @@ class $modify(FrameLayer, PlayLayer) {
         g_probing = true;
         g_probeDead = false;
         g_probeInvalid = false;
+        g_simLog.clear();
+        g_probeBase = p.baseFrame;
+        g_probeTick0 = g_probeTick;
         if (kDebug && d == 0) g_diagStep = -1;
 
         if (p.heldAtBase) {
@@ -350,40 +362,43 @@ class $modify(FrameLayer, PlayLayer) {
             }
             if (!stepFrame()) break;
             if (m_player1 && m_player1->m_isDead) g_probeDead = true;
-
-            if (kDebug && d == 0 && g_diagStep < 0 && m_player1) {
-                if (auto rp = posAt(t + 1)) {
-                    float dx = std::fabs(m_player1->getPositionX() - rp->x);
-                    float dy = std::fabs(m_player1->getPositionY() - rp->y);
-                    if (dx > kPosTol || dy > kPosTol) {
-                        g_diagStep = t + 1 - p.baseFrame;
-                        g_diagDx = dx;
-                        g_diagDy = dy;
-                    }
-                }
-            }
         }
         g_probing = false;
         g_own = false;
         if (g_probeInvalid) return -1;
-        if (g_probeDead) return 0;
         if (!m_player1) return -1;
 
-        float ex = m_player1->getPositionX();
         g_endY = m_player1->getPositionY();
 
+        bool bad = false;
         if (d == 0) {
-            auto rp = posAt(p.endFrame);
-            if (!rp) return -1;
-            g_diagXsim = ex;
-            g_diagXreal = rp->x;
-            float dx = std::fabs(ex - rp->x);
-            float dy = std::fabs(g_endY - rp->y);
-            if (dx > kPosTol || dy > kPosTol) {
-                g_dbg[7]++;
-                if (kStrictDrift) return -2;
+            for (size_t i = 0; i < g_simLog.size(); i++) {
+                auto rp = posAt(g_simLog[i].frame);
+                if (!rp) continue;
+                float dx = std::fabs(g_simLog[i].x - rp->x);
+                float dy = std::fabs(g_simLog[i].y - rp->y);
+                if (dx > kPosTol || dy > kPosTol) {
+                    g_diagStep = static_cast<int>(i);
+                    g_diagDx = dx;
+                    g_diagDy = dy;
+                    bad = true;
+                    break;
+                }
             }
+            if (kDebug && g_simLog.size() > 1) {
+                auto r0 = posAt(g_simLog[0].frame);
+                auto r1 = posAt(g_simLog[0].frame + 1);
+                if (r0 && r1) g_diagMovReal = r1->x - r0->x;
+                g_diagMovSim = g_simLog[1].x - g_simLog[0].x;
+                g_diagXsim = g_simLog.back().x;
+                auto re = posAt(g_simLog.back().frame);
+                if (re) g_diagXreal = re->x;
+            }
+            if (bad) g_dbg[7]++;
         }
+
+        if (bad && kStrictDrift) return -2;
+        if (g_probeDead) return 0;
         return 1;
     }
 
@@ -458,6 +473,8 @@ class $modify(FrameLayer, PlayLayer) {
         g_diagDy = 0.f;
         g_diagXsim = 0.f;
         g_diagXreal = 0.f;
+        g_diagMovReal = 0.f;
+        g_diagMovSim = 0.f;
         g_hudDirty = true;
 
         CCNode* parent = this;
@@ -577,9 +594,9 @@ class $modify(FrameLayer, PlayLayer) {
         }
         if (kDebug && f->diagLabel) {
             std::string s = fmt::format(
-                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}",
+                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}",
                 g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal,
-                g_lastAdv, g_tw, g_restDx, g_restDy);
+                g_diagMovReal, g_diagMovSim, g_lastAdv, g_tw, g_restDx, g_restDy);
             f->diagLabel->setString(s.c_str());
         }
     }
