@@ -16,11 +16,12 @@ using namespace geode::prelude;
 static constexpr float kScale = 0.6f;
 static constexpr float kPad = 10.f;
 
-static constexpr int kBack = 5;
-static constexpr int kFwd = 5;
+static constexpr int kBack = 8;
+static constexpr int kFwd = 8;
 static constexpr int kSnapEvery = 5;
 static constexpr int kMargin = 2;
-static constexpr int kHorizon = 120;      // frames que se analizan tras el click
+static constexpr int kHorizon = 120;      // frames maximos que se analizan tras el click
+static constexpr int kChainSpan = 30;     // si hay otro click antes de esto, el click se descarta
 static constexpr size_t kMaxPending = 30;
 static constexpr int kNoClick = 1000;
 static constexpr int kNever = 0x7fffffff;
@@ -35,15 +36,14 @@ static constexpr bool kDisableIfXdbot = false;
 static constexpr bool kUsePlayLayerUpdate = false;
 
 // Convergencia: frames seguidos con la misma posicion que la real para dar el sondeo por superado
-static constexpr int kConvFrames = 3;
+static constexpr int kConvFrames = 5;
 static constexpr float kConvTol = 0.01f;
 
 // Desfase de la carga del checkpoint: frames maximos que se buscan hacia atras
 static constexpr int kLagMax = 8;
 
-// Al morir: los clicks mas cerca que esto de la muerte se descartan (probable click fallido)
+// Al morir: los clicks mas cerca que esto de la muerte se descartan
 static constexpr int kDeathMargin = 2;
-static constexpr int kMinSpan = 30;
 // Historial de posiciones reales (frames)
 static constexpr size_t kPosKeep = 2400;
 
@@ -56,8 +56,9 @@ static constexpr float kSlowFrameMs = 20.f;
 static int g_frame = 0;
 static int g_deathFrame = -1;
 static std::array<int, 7> g_counts = {0, 0, 0, 0, 0, 0, 0};
-// 0 son, 1 ok, 2 sc, 3 d0, 4 pas, 5 clk, 6 inv, 7 dev, 8 trg, 9 perd, 10 resc, 11 cola
-static std::array<int, 12> g_dbg = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// 0 son, 1 ok, 2 sc, 3 d0, 4 pas, 5 clk, 6 inv, 7 dev, 8 trg, 9 perd, 10 resc, 11 cola,
+// 12 inest, 13 trunc, 14 enc
+static std::array<int, 15> g_dbg = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static int g_lastAdv = 1;
 static bool g_hudDirty = true;
 
@@ -126,13 +127,16 @@ struct Pending {
     std::vector<Input> inputs;   // desde baseFrame - kLagMax
     int dMin = 0;
     int dMax = 0;
-    // 0 clic real, 1 sin clic, 2 barrido hacia atras, 3 hacia delante, 4 barrido completo
+    // 0 clic real, 1 sin clic, 2 barrido hacia atras, 3 hacia delante
     int stage = 0;
     int d = 0;
+    bool confirm = false;        // repitiendo un fallo para confirmarlo
+    bool cutBack = false;        // todo el rango hacia atras sobrevivio
+    bool cutFwd = false;         // todo el rango hacia delante sobrevivio
     int w = -1;                  // ventana final; -1 = sin medir
     float y0 = 0.f;
     // resultado por desplazamiento d (indice d+8): -1 sin probar, 0 muere, 1 sobrevive
-    std::array<signed char, 16> res{};
+    std::array<signed char, 17> res{};
 };
 
 static std::deque<Snap> g_ring;
@@ -155,7 +159,7 @@ static float g_diagMovSim = 0.f;
 static float g_restX = 0.f;
 static float g_sim0X = 0.f;
 static float g_real0X = 0.f;
-// ultimo desfase medido (diagnostico y valor de reserva)
+// ultimo desfase medido (diagnostico)
 static int g_lag = -1;
 static int g_lagMin = 99;
 static int g_lagMax = -1;
@@ -184,7 +188,7 @@ static void pushSnap(PlayLayer* pl) {
     if (!cp) return;
     cp->retain();
     g_ring.push_back({g_frame, cp});
-    while (g_ring.size() > static_cast<size_t>(kBack / kSnapEvery + 2)) {
+    while (g_ring.size() > static_cast<size_t>(kBack / kSnapEvery + 3)) {
         g_ring.front().cp->release();
         g_ring.pop_front();
     }
@@ -215,6 +219,14 @@ static bool heldAtFrame(int frame) {
     return lb > 0 ? g_log[lb - 1].down : false;
 }
 
+// Frame del primer click (pulsacion) posterior a "frame", o kNever si no hay
+static int nextDownAfter(int frame) {
+    for (size_t j = logLowerBound(frame + 1); j < g_log.size(); j++) {
+        if (g_log[j].down) return g_log[j].frame;
+    }
+    return kNever;
+}
+
 static bool windowHasTrigger(int a, int b) {
     for (auto it = g_trigFrames.rbegin(); it != g_trigFrames.rend(); ++it) {
         if (*it < a) break;
@@ -243,30 +255,17 @@ static std::vector<Input> shiftedInputs(const Pending& p, int d) {
     return out;
 }
 
-// Racha mas larga de desplazamientos que sobreviven (empate: la mas cercana a 0)
-static int bestRun(const Pending& p) {
-    int best = 0;
-    int bestDist = 1000;
-    int d = p.dMin;
-    while (d <= p.dMax) {
-        if (p.res[d + 8] == 1) {
-            int s = d;
-            while (d <= p.dMax && p.res[d + 8] == 1) d++;
-            int len = d - s;
-            int dist = (s <= 0 && d > 0) ? 0 : std::min(std::abs(s), std::abs(d - 1));
-            if (len > best || (len == best && dist < bestDist)) {
-                best = len;
-                bestDist = dist;
-            }
-        } else {
-            d++;
-        }
-    }
-    return best;
-}
-
-// Convierte un click en espera en un trabajo de sondeo con la ventana [base, end)
+// Convierte un click en espera en un trabajo de sondeo con la ventana [base, end).
+// El analisis termina como muy tarde en el siguiente click real.
 static void queueJob(const Open& o, int end) {
+    end = std::min(end, nextDownAfter(o.clickFrame));
+
+    if (end - o.clickFrame < kChainSpan) {
+        o.base->release();
+        g_dbg[14]++;
+        g_hudDirty = true;
+        return;
+    }
     if (windowHasTrigger(o.baseFrame - kTrigLookback, end)) {
         g_dbg[8]++;
         g_hudDirty = true;
@@ -301,13 +300,13 @@ static void queueJob(const Open& o, int end) {
     g_pending.push_back(std::move(p));
 }
 
-// Al reaparecer: rescata los clicks que esperaban, recortando su ventana a la muerte.
+// Al reaparecer: rescata los clicks que esperaban solo si su analisis termina ANTES de la muerte.
 // La cola de trabajos y el historial se conservan para terminar el analisis.
 static void rescueWaiting() {
     int cap = (g_deathFrame >= 0) ? g_deathFrame - kDeathMargin : g_frame - 1;
     for (auto& o : g_waiting) {
-        int end = std::min(o.clickFrame + kHorizon, cap);
-        if (end - o.clickFrame < kMinSpan) {
+        int end = std::min(o.clickFrame + kHorizon, nextDownAfter(o.clickFrame));
+        if (cap < end) {
             o.base->release();
             g_dbg[9]++;
             continue;
@@ -473,11 +472,7 @@ class $modify(FrameLayer, PlayLayer) {
             g_lagMax = std::max(g_lagMax, best);
             return true;
         }
-        // sin dato fiable: reutiliza el ultimo desfase conocido, o descarta
-        if (g_lag >= 0) {
-            p.lag = g_lag;
-            return true;
-        }
+        // sin dato fiable: se descarta (sin reutilizar desfases ajenos)
         return false;
     }
 
@@ -615,14 +610,23 @@ class $modify(FrameLayer, PlayLayer) {
         return 1;
     }
 
+    // Ventana = 1 (el click real) + frames seguidos que sobreviven a cada lado
     bool finishJob(Pending& p) {
-        int run = bestRun(p);
-        if (run <= 0) {
-            g_dbg[3]++;       // ningun frame sobrevive
-        } else {
-            p.w = run;
-            g_dbg[1]++;
+        int back = 0, fwd = 0;
+        for (int d = -1; d >= p.dMin && p.res[d + 8] == 1; d--) back++;
+        for (int d = 1; d <= p.dMax && p.res[d + 8] == 1; d++) fwd++;
+        int w = 1 + back + fwd;
+
+        // Rango recortado por falta de datos (no por kBack/kFwd): el ancho real podria ser mayor
+        bool cutB = p.cutBack && p.dMin > -kBack;
+        bool cutF = p.cutFwd && p.dMax < kFwd;
+        if ((cutB || cutF) && w < 9) {
+            g_dbg[13]++;
+            return true;
         }
+
+        p.w = w;
+        g_dbg[1]++;
         return true;
     }
 
@@ -631,13 +635,14 @@ class $modify(FrameLayer, PlayLayer) {
         g_hudDirty = true;
         switch (p.stage) {
             case 0: {
-                // Clic real: sirve de referencia, pero NO se descarta si muere
+                // Clic real: tiene que sobrevivir en la simulacion igual que en la partida real
                 g_dbg[0]++;
                 int r = survives(p, 0);
                 if (r == -1) { g_dbg[4]++; return true; }
                 if (r == -2) { return true; }
-                p.res[8] = (r == 1) ? 1 : 0;
-                if (r == 1) p.y0 = g_endY;
+                if (r == 0) { g_dbg[3]++; return true; }
+                p.res[8] = 1;
+                p.y0 = g_endY;
                 p.stage = 1;
                 return false;
             }
@@ -650,38 +655,51 @@ class $modify(FrameLayer, PlayLayer) {
                     if (kDebug) g_diagEffect = std::fabs(g_endY - p.y0);
                     return true;
                 }
-                if (p.res[8] == 1) { p.d = -1; p.stage = 2; }       // barrido hacia fuera
-                else { p.d = p.dMin; p.stage = 4; }                 // d=0 murio: barrido completo
+                p.d = -1;
+                p.stage = 2;
                 return false;
             }
             case 2: {
-                // Hacia atras desde d = -1, parando en el primer fallo
-                if (p.d < p.dMin) { p.d = 1; p.stage = 3; return false; }
+                // Hacia atras desde d = -1; cada fallo se confirma repitiendolo
+                if (p.d < p.dMin) {
+                    p.cutBack = true;
+                    p.d = 1;
+                    p.stage = 3;
+                    return false;
+                }
                 int r = survives(p, p.d);
                 if (r == -1) { g_dbg[4]++; return true; }
-                p.res[p.d + 8] = (r == 1) ? 1 : 0;
-                if (r == 1) p.d--;
-                else { p.d = 1; p.stage = 3; }
+                if (r == 1) {
+                    if (p.confirm) { g_dbg[12]++; return true; }   // antes murio, ahora no: inestable
+                    p.res[p.d + 8] = 1;
+                    p.d--;
+                    return false;
+                }
+                if (!p.confirm) { p.confirm = true; return false; }
+                p.confirm = false;
+                p.res[p.d + 8] = 0;
+                p.d = 1;
+                p.stage = 3;
                 return false;
-            }
-            case 3: {
-                // Hacia delante desde d = 1, parando en el primer fallo
-                if (p.d > p.dMax) return finishJob(p);
-                int r = survives(p, p.d);
-                if (r == -1) { g_dbg[4]++; return true; }
-                p.res[p.d + 8] = (r == 1) ? 1 : 0;
-                if (r == 1) { p.d++; return false; }
-                return finishJob(p);
             }
             default: {
-                // Barrido completo (solo si d=0 no sobrevivio)
-                if (p.d == 0) p.d++;
-                if (p.d > p.dMax) return finishJob(p);
+                // Hacia delante desde d = 1; cada fallo se confirma repitiendolo
+                if (p.d > p.dMax) {
+                    p.cutFwd = true;
+                    return finishJob(p);
+                }
                 int r = survives(p, p.d);
                 if (r == -1) { g_dbg[4]++; return true; }
-                p.res[p.d + 8] = (r == 1) ? 1 : 0;
-                p.d++;
-                return false;
+                if (r == 1) {
+                    if (p.confirm) { g_dbg[12]++; return true; }
+                    p.res[p.d + 8] = 1;
+                    p.d++;
+                    return false;
+                }
+                if (!p.confirm) { p.confirm = true; return false; }
+                p.confirm = false;
+                p.res[p.d + 8] = 0;
+                return finishJob(p);
             }
         }
     }
@@ -772,7 +790,7 @@ class $modify(FrameLayer, PlayLayer) {
             m_fields->dbgLabel = addLabel("-", kScale * 0.5f,
                 ccp(left + totalW + 8.f, top - 24.f), ccColor3B{255, 255, 0}, 101);
             m_fields->diagLabel = addLabel("-", kScale * 0.5f,
-                ccp(left + totalW + 8.f, top - 100.f), ccColor3B{120, 255, 120}, 101);
+                ccp(left + totalW + 8.f, top - 120.f), ccColor3B{120, 255, 120}, 101);
         }
 
         return true;
@@ -783,7 +801,7 @@ class $modify(FrameLayer, PlayLayer) {
             Open o = g_waiting[i];
             if (g_frame < o.clickFrame + kHorizon) { i++; continue; }
             g_waiting.erase(g_waiting.begin() + i);
-            queueJob(o, o.clickFrame + kHorizon);   // horizonte fijo
+            queueJob(o, o.clickFrame + kHorizon);   // horizonte fijo, recortado al siguiente click
         }
     }
 
@@ -791,7 +809,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v13", g_frame);
+            std::string s = fmt::format("Frame: {} v15", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
@@ -804,13 +822,14 @@ class $modify(FrameLayer, PlayLayer) {
             }
         }
         if (kDebug && f->dbgLabel) {
-            int desc = g_dbg[2] + g_dbg[3] + g_dbg[4] + (kStrictDrift ? g_dbg[7] : 0);
+            int desc = g_dbg[2] + g_dbg[3] + g_dbg[4] + g_dbg[12] + g_dbg[13] + (kStrictDrift ? g_dbg[7] : 0);
             int curso = g_dbg[0] - g_dbg[1] - desc;
             std::string s = fmt::format(
-                "clk {} son {} ok {}\nsc {} d0 {} pas {} dev {} inv {} trg {}\nson {} = ok {} + desc {} + curso {}\nresc {} perd {} cola {}",
+                "clk {} son {} ok {}\nsc {} d0 {} pas {} dev {} inv {} trg {}\nson {} = ok {} + desc {} + curso {}\nresc {} perd {} cola {}\ninest {} trunc {} enc {}",
                 g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[7], g_dbg[6], g_dbg[8],
                 g_dbg[0], g_dbg[1], desc, curso,
-                g_dbg[10], g_dbg[9], g_dbg[11]);
+                g_dbg[10], g_dbg[9], g_dbg[11],
+                g_dbg[12], g_dbg[13], g_dbg[14]);
             f->dbgLabel->setString(s.c_str());
         }
         if (kDebug && f->diagLabel) {
