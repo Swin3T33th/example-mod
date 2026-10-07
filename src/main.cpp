@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <deque>
+#include <string>
 #include <vector>
 
 using namespace geode::prelude;
@@ -18,9 +19,10 @@ static constexpr float kPad = 10.f;
 
 static constexpr int kBack = 8;
 static constexpr int kFwd = 8;
+static_assert(kBack <= 8 && kFwd <= 8, "res usa indice d+8 y tamano 17");
 static constexpr int kSnapEvery = 5;
 static constexpr int kMargin = 2;
-static constexpr int kHorizon = 120;      // frames maximos que se analizan tras el click
+static constexpr int kHorizon = 150;      // frames que se observan tras el click (mas que lo que dura un salto)
 static constexpr int kChainSpan = 30;     // si hay otro click antes de esto, el click se descarta
 static constexpr size_t kMaxPending = 30;
 static constexpr int kNoClick = 1000;
@@ -57,8 +59,8 @@ static int g_frame = 0;
 static int g_deathFrame = -1;
 static std::array<int, 7> g_counts = {0, 0, 0, 0, 0, 0, 0};
 // 0 son, 1 ok, 2 sc, 3 d0, 4 pas, 5 clk, 6 inv, 7 dev, 8 trg, 9 perd, 10 resc, 11 cola,
-// 12 inest, 13 trunc, 14 enc
-static std::array<int, 15> g_dbg = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// 12 inest, 13 trunc, 14 enc, 15 ext
+static std::array<int, 16> g_dbg = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static int g_lastAdv = 1;
 static bool g_hudDirty = true;
 
@@ -75,6 +77,14 @@ static float g_restDy = -1.f;
 static long long g_stepsTotal = 0;
 static long long g_runsTotal = 0;
 static int g_convCount = 0;
+
+// Resumen del ultimo click clasificado (para el panel azul)
+static std::string g_lastPattern = "-";
+static int g_lastClickF = -1;
+static int g_lastW = -1;
+static int g_lastDeathL = -999;
+static int g_lastDeathR = -999;
+static int g_lastDeathRel = -999;
 
 static const char* g_names[7] = {"9+:", "7-8:", "5-6:", "4:", "3:", "2:", "1:"};
 static const ccColor3B g_colors[7] = {
@@ -137,6 +147,8 @@ struct Pending {
     float y0 = 0.f;
     // resultado por desplazamiento d (indice d+8): -1 sin probar, 0 muere, 1 sobrevive
     std::array<signed char, 17> res{};
+    // frame (relativo al click) en que murio la simulacion de ese desplazamiento
+    std::array<short, 17> dead{};
 };
 
 static std::deque<Snap> g_ring;
@@ -256,11 +268,10 @@ static std::vector<Input> shiftedInputs(const Pending& p, int d) {
 }
 
 // Convierte un click en espera en un trabajo de sondeo con la ventana [base, end).
-// El analisis termina como muy tarde en el siguiente click real.
+// La observacion dura siempre hasta "end" (no se corta en el siguiente click).
 static void queueJob(const Open& o, int end) {
-    end = std::min(end, nextDownAfter(o.clickFrame));
-
-    if (end - o.clickFrame < kChainSpan) {
+    // otro click demasiado cerca: no se puede medir este click por separado
+    if (nextDownAfter(o.clickFrame) - o.clickFrame < kChainSpan) {
         o.base->release();
         g_dbg[14]++;
         g_hudDirty = true;
@@ -279,6 +290,7 @@ static void queueJob(const Open& o, int end) {
     p.clickFrame = o.clickFrame;
     p.endFrame = end;
     p.res.fill(-1);
+    p.dead.fill(-999);
 
     // frame real en que se suelta este click
     for (size_t j = logLowerBound(o.clickFrame + 1); j < g_log.size(); j++) {
@@ -300,12 +312,12 @@ static void queueJob(const Open& o, int end) {
     g_pending.push_back(std::move(p));
 }
 
-// Al reaparecer: rescata los clicks que esperaban solo si su analisis termina ANTES de la muerte.
+// Al reaparecer: rescata los clicks que esperaban solo si su analisis COMPLETO termina antes de la muerte.
 // La cola de trabajos y el historial se conservan para terminar el analisis.
 static void rescueWaiting() {
     int cap = (g_deathFrame >= 0) ? g_deathFrame - kDeathMargin : g_frame - 1;
     for (auto& o : g_waiting) {
-        int end = std::min(o.clickFrame + kHorizon, nextDownAfter(o.clickFrame));
+        int end = o.clickFrame + kHorizon;
         if (cap < end) {
             o.base->release();
             g_dbg[9]++;
@@ -364,8 +376,12 @@ class $modify(FrameBase, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        // Ignora clics de otros mods (xdBot) mientras se sondea
-        if (g_probing && !g_own) return;
+        // Ignora clics de otros mods (xdBot) mientras se sondea, y los cuenta
+        if (g_probing && !g_own) {
+            g_dbg[15]++;
+            g_hudDirty = true;
+            return;
+        }
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
         if (g_probing) return;
@@ -398,6 +414,7 @@ class $modify(FrameLayer, PlayLayer) {
         CCLabelBMFont* frameLabel = nullptr;
         CCLabelBMFont* dbgLabel = nullptr;
         CCLabelBMFont* diagLabel = nullptr;
+        CCLabelBMFont* patLabel = nullptr;
         std::array<CCLabelBMFont*, 7> values = {};
         int hudTick = 0;
     };
@@ -520,6 +537,7 @@ class $modify(FrameLayer, PlayLayer) {
         if (!startProbe(p, inputs, t0)) {
             g_probing = false;
             g_own = false;
+            g_lastDeathRel = -999;
             return -1;
         }
 
@@ -538,6 +556,7 @@ class $modify(FrameLayer, PlayLayer) {
         int conv = 0;
         bool converged = false;
         int steps = 0;
+        int deathT = -1;
 
         for (int t = t0; t < p.endFrame && !g_probeDead && !g_probeInvalid; t++) {
             while (k < inputs.size() && inputs[k].frame <= t) {
@@ -549,7 +568,7 @@ class $modify(FrameLayer, PlayLayer) {
             if (!stepFrame()) break;
             steps++;
             if (m_player1 && m_player1->m_isDead) g_probeDead = true;
-            if (g_probeDead) break;
+            if (g_probeDead) { deathT = t; break; }
 
             // Salida temprana: ya no quedan diferencias de input y la simulacion
             // iguala la trayectoria real durante kConvFrames frames seguidos
@@ -566,6 +585,7 @@ class $modify(FrameLayer, PlayLayer) {
         }
         g_probing = false;
         g_own = false;
+        g_lastDeathRel = (deathT >= 0) ? deathT - p.clickFrame : -999;
         g_stepsTotal += steps;
         g_runsTotal++;
         if (converged) g_convCount++;
@@ -612,10 +632,27 @@ class $modify(FrameLayer, PlayLayer) {
 
     // Ventana = 1 (el click real) + frames seguidos que sobreviven a cada lado
     bool finishJob(Pending& p) {
+        // resumen para el panel azul
+        std::string pat;
+        for (int d = -kBack; d <= kFwd; d++) {
+            if (d == 0) { pat += 'R'; continue; }
+            signed char v = p.res[d + 8];
+            pat += (v == 1) ? 'o' : (v == 0 ? 'x' : '-');
+        }
+        g_lastPattern = pat;
+        g_lastClickF = p.clickFrame;
+
         int back = 0, fwd = 0;
         for (int d = -1; d >= p.dMin && p.res[d + 8] == 1; d--) back++;
         for (int d = 1; d <= p.dMax && p.res[d + 8] == 1; d++) fwd++;
         int w = 1 + back + fwd;
+
+        int lf = -(back + 1);
+        int rf = fwd + 1;
+        g_lastDeathL = (lf >= p.dMin && p.res[lf + 8] == 0) ? p.dead[lf + 8] : -999;
+        g_lastDeathR = (rf <= p.dMax && p.res[rf + 8] == 0) ? p.dead[rf + 8] : -999;
+        g_lastW = w;
+        g_hudDirty = true;
 
         // Rango recortado por falta de datos (no por kBack/kFwd): el ancho real podria ser mayor
         bool cutB = p.cutBack && p.dMin > -kBack;
@@ -678,6 +715,7 @@ class $modify(FrameLayer, PlayLayer) {
                 if (!p.confirm) { p.confirm = true; return false; }
                 p.confirm = false;
                 p.res[p.d + 8] = 0;
+                p.dead[p.d + 8] = static_cast<short>(g_lastDeathRel);
                 p.d = 1;
                 p.stage = 3;
                 return false;
@@ -699,6 +737,7 @@ class $modify(FrameLayer, PlayLayer) {
                 if (!p.confirm) { p.confirm = true; return false; }
                 p.confirm = false;
                 p.res[p.d + 8] = 0;
+                p.dead[p.d + 8] = static_cast<short>(g_lastDeathRel);
                 return finishJob(p);
             }
         }
@@ -740,6 +779,12 @@ class $modify(FrameLayer, PlayLayer) {
         g_stepsTotal = 0;
         g_runsTotal = 0;
         g_convCount = 0;
+        g_lastPattern = "-";
+        g_lastClickF = -1;
+        g_lastW = -1;
+        g_lastDeathL = -999;
+        g_lastDeathR = -999;
+        g_lastDeathRel = -999;
         g_hudDirty = true;
 
         CCNode* parent = this;
@@ -787,6 +832,8 @@ class $modify(FrameLayer, PlayLayer) {
             ccp(left + kPad, top - totalH - 4.f), ccColor3B{255, 255, 255}, 100);
 
         if (kDebug) {
+            m_fields->patLabel = addLabel("-", kScale * 0.45f,
+                ccp(left + kPad, top - totalH - 24.f), ccColor3B{120, 220, 255}, 101);
             m_fields->dbgLabel = addLabel("-", kScale * 0.5f,
                 ccp(left + totalW + 8.f, top - 24.f), ccColor3B{255, 255, 0}, 101);
             m_fields->diagLabel = addLabel("-", kScale * 0.5f,
@@ -801,7 +848,7 @@ class $modify(FrameLayer, PlayLayer) {
             Open o = g_waiting[i];
             if (g_frame < o.clickFrame + kHorizon) { i++; continue; }
             g_waiting.erase(g_waiting.begin() + i);
-            queueJob(o, o.clickFrame + kHorizon);   // horizonte fijo, recortado al siguiente click
+            queueJob(o, o.clickFrame + kHorizon);   // observacion completa de kHorizon frames
         }
     }
 
@@ -809,7 +856,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v15", g_frame);
+            std::string s = fmt::format("Frame: {} v17", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
@@ -821,15 +868,20 @@ class $modify(FrameLayer, PlayLayer) {
                 f->values[i]->setString(s.c_str());
             }
         }
+        if (kDebug && f->patLabel) {
+            std::string s = fmt::format("ult f{} w{}\n{}\nmuere izq {} der {}",
+                g_lastClickF, g_lastW, g_lastPattern, g_lastDeathL, g_lastDeathR);
+            f->patLabel->setString(s.c_str());
+        }
         if (kDebug && f->dbgLabel) {
             int desc = g_dbg[2] + g_dbg[3] + g_dbg[4] + g_dbg[12] + g_dbg[13] + (kStrictDrift ? g_dbg[7] : 0);
             int curso = g_dbg[0] - g_dbg[1] - desc;
             std::string s = fmt::format(
-                "clk {} son {} ok {}\nsc {} d0 {} pas {} dev {} inv {} trg {}\nson {} = ok {} + desc {} + curso {}\nresc {} perd {} cola {}\ninest {} trunc {} enc {}",
+                "clk {} son {} ok {}\nsc {} d0 {} pas {} dev {} inv {} trg {}\nson {} = ok {} + desc {} + curso {}\nresc {} perd {} cola {}\ninest {} trunc {} enc {} ext {}",
                 g_dbg[5], g_dbg[0], g_dbg[1], g_dbg[2], g_dbg[3], g_dbg[4], g_dbg[7], g_dbg[6], g_dbg[8],
                 g_dbg[0], g_dbg[1], desc, curso,
                 g_dbg[10], g_dbg[9], g_dbg[11],
-                g_dbg[12], g_dbg[13], g_dbg[14]);
+                g_dbg[12], g_dbg[13], g_dbg[14], g_dbg[15]);
             f->dbgLabel->setString(s.c_str());
         }
         if (kDebug && f->diagLabel) {
