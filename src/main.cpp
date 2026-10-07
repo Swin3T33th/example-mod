@@ -50,6 +50,7 @@ static float g_diagEffect = -1.f;
 static float g_diagXsim = 0.f;
 static float g_diagXreal = 0.f;
 static float g_endY = 0.f;
+static float g_tw = 1.f;
 
 static const char* g_names[7] = {"9+:", "7-8:", "5-6:", "4:", "3:", "2:", "1:"};
 static const ccColor3B g_colors[7] = {
@@ -111,6 +112,7 @@ static std::vector<Open> g_waiting;
 static std::deque<Pending> g_pending;
 static bool g_probing = false;
 static bool g_inPost = false;
+static bool g_own = false;   // true solo cuando el clic lo mete este mod
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
 static int g_probeTick = 0;
@@ -127,6 +129,7 @@ static void clearProbeState() {
     g_trigFrames.clear();
     g_probing = false;
     g_inPost = false;
+    g_own = false;
 }
 
 static void pushSnap(PlayLayer* pl) {
@@ -222,6 +225,9 @@ class $modify(FrameBase, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        // Ignora clics de otros mods (xdBot) mientras se sondea
+        if (g_probing && !g_own) return;
+
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
         if (g_probing) return;
         if (!PlayLayer::get() || !isPlayer1 || button != 1) return;
@@ -264,6 +270,7 @@ class $modify(FrameLayer, PlayLayer) {
 
     bool stepFrame() {
         // Si tu versión de Geode no tiene m_timeWarp, usa: float dt = kStepDt;
+        g_tw = m_gameState.m_timeWarp;
         float dt = kStepDt / std::max(0.01f, m_gameState.m_timeWarp);
         int advanced = 0;
         for (int attempt = 0; attempt < 2 && advanced == 0; attempt++) {
@@ -289,12 +296,18 @@ class $modify(FrameLayer, PlayLayer) {
         g_probeInvalid = false;
         if (kDebug && d == 0) g_diagStep = -1;
 
-        if (p.heldAtBase) this->handleButton(true, 1, true);
+        if (p.heldAtBase) {
+            g_own = true;
+            this->handleButton(true, 1, true);
+            g_own = false;
+        }
 
         size_t k = 0;
         for (int t = p.baseFrame; t < p.endFrame && !g_probeDead && !g_probeInvalid; t++) {
             while (k < inputs.size() && inputs[k].frame <= t) {
+                g_own = true;
                 this->handleButton(inputs[k].down, 1, true);
+                g_own = false;
                 k++;
             }
             if (!stepFrame()) break;
@@ -313,6 +326,7 @@ class $modify(FrameLayer, PlayLayer) {
             }
         }
         g_probing = false;
+        g_own = false;
         if (g_probeInvalid) return -1;
         if (g_probeDead) return 0;
 
@@ -504,8 +518,8 @@ class $modify(FrameLayer, PlayLayer) {
         }
         if (kDebug && f->diagLabel) {
             std::string s = fmt::format(
-                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}",
-                g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal);
+                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nadv {} tw {:.3f}",
+                g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal, g_lastAdv, g_tw);
             f->diagLabel->setString(s.c_str());
         }
     }
