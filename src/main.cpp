@@ -21,16 +21,16 @@ static constexpr int kSnapEvery = 5;
 static constexpr int kMargin = 2;
 static constexpr int kHorizon = 60;
 static constexpr int kMinHorizon = 20;
-static constexpr int kCap = 9;            // ventana máxima a medir (fila 9+)
+static constexpr int kCap = 9;
 static constexpr size_t kMaxPending = 6;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 0.9999f / 240.f;
 static constexpr bool kStrictDrift = false;
-static constexpr bool kAnyTrigger = false; // true: cualquier trigger descarta el click
-static constexpr bool kDebug = true;       // false: sin etiquetas de depuración
+static constexpr bool kAnyTrigger = false;
+static constexpr bool kDebug = true;
+static constexpr bool kDisableIfXdbot = false; // true: no sondea si xdBot está cargado
 
-// Presupuesto de sondeo por frame (ms). Pon 1000.f para sondear todo de golpe.
 static constexpr float kBudgetMs = 4.f;
 static constexpr float kBudgetSlowMs = 1.f;
 static constexpr float kSlowFrameMs = 20.f;
@@ -67,17 +67,16 @@ static int rowForWidth(int w) {
     return 6;
 }
 
-// Triggers que pueden cambiar la colisión o la trayectoria
 static bool affectsGameplay(int id) {
     if (kAnyTrigger) return true;
     switch (id) {
-        case 901:   // move
-        case 1346:  // rotate
-        case 2067:  // scale
-        case 1347:  // follow
-        case 1814:  // follow player Y
-        case 1049:  // toggle
-        case 1268:  // spawn
+        case 901:
+        case 1346:
+        case 2067:
+        case 1347:
+        case 1814:
+        case 1049:
+        case 1268:
             return true;
         default:
             return false;
@@ -94,13 +93,13 @@ struct Pending {
     int baseFrame = 0;
     int clickFrame = 0;
     int endFrame = 0;
-    std::vector<Input> inputs;   // inputs dentro de la ventana, calculados una vez
-    bool heldAtBase = false;     // botón pulsado al inicio de la ventana
+    std::vector<Input> inputs;
+    bool heldAtBase = false;
     int dMin = 0;
     int dMax = 0;
-    int stage = 0;               // 0 con click, 1 sin click, 2 hacia atrás, 3 hacia delante
+    int stage = 0;
     int d = 0;
-    int w = -1;                  // resultado: ancho de ventana, -1 = descartado
+    int w = -1;
     float y0 = 0.f;
 };
 
@@ -111,7 +110,7 @@ static std::deque<int> g_trigFrames;
 static std::vector<Open> g_waiting;
 static std::deque<Pending> g_pending;
 static bool g_probing = false;
-static bool g_inPost = false;   // evita que postUpdate se llame a sí mismo
+static bool g_inPost = false;
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
 static int g_probeTick = 0;
@@ -141,7 +140,6 @@ static void pushSnap(PlayLayer* pl) {
     }
 }
 
-// Posición real registrada tras completar el frame "frame"
 static const Pos* posAt(int frame) {
     if (g_posLog.empty()) return nullptr;
     int idx = frame - g_posLog.front().frame;
@@ -150,7 +148,6 @@ static const Pos* posAt(int frame) {
     return p->frame == frame ? p : nullptr;
 }
 
-// Primer índice del log con frame >= "frame" (el log está ordenado)
 static size_t logLowerBound(int frame) {
     size_t lo = 0, hi = g_log.size();
     while (lo < hi) {
@@ -169,7 +166,6 @@ static bool windowHasTrigger(int a, int b) {
     return false;
 }
 
-// Inputs de la ventana con el click desplazado d frames (o quitado con kNoClick)
 static std::vector<Input> shiftedInputs(const Pending& p, int d) {
     std::vector<Input> out = p.inputs;
     if (d == 0) return out;
@@ -192,7 +188,6 @@ static std::vector<Input> shiftedInputs(const Pending& p, int d) {
 
 class $modify(FrameTrigger, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int p1, gd::vector<int> const* p2) {
-        // Durante el sondeo NUNCA se ejecuta un trigger: no puede tocar el nivel real
         if (g_probing) return;
         if (PlayLayer::get() && affectsGameplay(m_objectID)) {
             g_trigFrames.push_back(g_frame);
@@ -259,8 +254,6 @@ class $modify(FrameLayer, PlayLayer) {
         CCLabelBMFont* dbgLabel = nullptr;
         CCLabelBMFont* diagLabel = nullptr;
         std::array<CCLabelBMFont*, 7> values = {};
-        CheckpointObject* saved = nullptr;
-        int savedFrame = 0;
         int hudTick = 0;
     };
 
@@ -288,7 +281,6 @@ class $modify(FrameLayer, PlayLayer) {
         return true;
     }
 
-    // 1 sobrevive, 0 muere, -1 inválido, -2 desviado (solo con kStrictDrift)
     int survives(const Pending& p, int d) {
         this->loadFromCheckpoint(p.base);
         auto inputs = shiftedInputs(p, d);
@@ -297,7 +289,6 @@ class $modify(FrameLayer, PlayLayer) {
         g_probeInvalid = false;
         if (kDebug && d == 0) g_diagStep = -1;
 
-        // El checkpoint puede no guardar si el botón estaba pulsado
         if (p.heldAtBase) this->handleButton(true, 1, true);
 
         size_t k = 0;
@@ -343,7 +334,6 @@ class $modify(FrameLayer, PlayLayer) {
         return 1;
     }
 
-    // Avanza un paso del sondeo de un click. Devuelve true cuando ya está resuelto.
     bool advanceJob(Pending& p) {
         g_hudDirty = true;
         switch (p.stage) {
@@ -391,21 +381,6 @@ class $modify(FrameLayer, PlayLayer) {
             return;
         }
         PlayLayer::destroyPlayer(player, object);
-    }
-
-    void onSave(CCObject*) {
-        if (!m_isPracticeMode) return;
-        if (m_fields->saved) m_fields->saved->release();
-        m_fields->saved = this->createCheckpoint();
-        if (m_fields->saved) m_fields->saved->retain();
-        m_fields->savedFrame = g_frame;
-    }
-
-    void onRestore(CCObject*) {
-        if (!m_fields->saved) return;
-        this->loadFromCheckpoint(m_fields->saved);
-        g_frame = m_fields->savedFrame;
-        clearProbeState();
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -468,39 +443,21 @@ class $modify(FrameLayer, PlayLayer) {
                 ccp(left + totalW + 8.f, top - 66.f), ccColor3B{120, 255, 120}, 101);
         }
 
-        auto menu = CCMenu::create();
-        menu->setPosition({0.f, 0.f});
-        menu->setZOrder(100);
-        auto saveBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Guardar", 80, true, "bigFont.fnt", "GJ_button_01.png", 50.f, 0.35f),
-            this, menu_selector(FrameLayer::onSave));
-        auto restoreBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Restaurar", 80, true, "bigFont.fnt", "GJ_button_01.png", 50.f, 0.35f),
-            this, menu_selector(FrameLayer::onRestore));
-        saveBtn->setPosition({winSize.width / 2.f - 48.f, 35.f});
-        restoreBtn->setPosition({winSize.width / 2.f + 48.f, 35.f});
-        menu->addChild(saveBtn);
-        menu->addChild(restoreBtn);
-        parent->addChild(menu);
-
         return true;
     }
 
-    // Convierte los clicks "esperando" en trabajos pendientes cuando ya pasó su horizonte
     void promoteWaiting() {
         for (size_t i = 0; i < g_waiting.size();) {
             Open o = g_waiting[i];
             if (g_frame < o.clickFrame + kHorizon) { i++; continue; }
             g_waiting.erase(g_waiting.begin() + i);
 
-            // El final se recorta al siguiente click (que no se desplaza)
             int end = o.clickFrame + kHorizon;
             for (size_t j = logLowerBound(o.clickFrame + 1); j < g_log.size(); j++) {
                 if (g_log[j].down) { end = std::min(end, g_log[j].frame); break; }
             }
             end = std::max(end, o.clickFrame + kMinHorizon);
 
-            // Un trigger dentro de la ventana haría la simulación infiel: sin coste
             if (windowHasTrigger(o.baseFrame, end)) {
                 g_dbg[8]++;
                 g_hudDirty = true;
@@ -556,14 +513,14 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
-        // Durante el sondeo (o dentro de otra pasada) no se hace nada más
         if (g_probing || g_inPost) return;
         g_inPost = true;
 
-        promoteWaiting();
+        bool skip = kDisableIfXdbot && Loader::get()->isModLoaded("zilko.xdbot");
 
-        if (!g_pending.empty() && m_isPracticeMode && m_player1 && !m_player1->m_isDead) {
-            // Si hay cola, se descartan los más viejos
+        if (!skip) promoteWaiting();
+
+        if (!skip && !g_pending.empty() && m_isPracticeMode && m_player1 && !m_player1->m_isDead) {
             while (g_pending.size() > kMaxPending) {
                 g_pending.front().base->release();
                 g_pending.pop_front();
