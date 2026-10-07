@@ -111,6 +111,7 @@ static std::deque<int> g_trigFrames;
 static std::vector<Open> g_waiting;
 static std::deque<Pending> g_pending;
 static bool g_probing = false;
+static bool g_inPost = false;   // evita que postUpdate se llame a sí mismo
 static bool g_probeDead = false;
 static bool g_probeInvalid = false;
 static int g_probeTick = 0;
@@ -125,6 +126,8 @@ static void clearProbeState() {
     g_log.clear();
     g_posLog.clear();
     g_trigFrames.clear();
+    g_probing = false;
+    g_inPost = false;
 }
 
 static void pushSnap(PlayLayer* pl) {
@@ -553,9 +556,13 @@ class $modify(FrameLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // Durante el sondeo (o dentro de otra pasada) no se hace nada más
+        if (g_probing || g_inPost) return;
+        g_inPost = true;
+
         promoteWaiting();
 
-        if (!g_pending.empty()) {
+        if (!g_pending.empty() && m_isPracticeMode && m_player1 && !m_player1->m_isDead) {
             // Si hay cola, se descartan los más viejos
             while (g_pending.size() > kMaxPending) {
                 g_pending.front().base->release();
@@ -586,6 +593,7 @@ class $modify(FrameLayer, PlayLayer) {
         }
 
         updateHud();
+        g_inPost = false;
     }
 
     void resetLevel() {
