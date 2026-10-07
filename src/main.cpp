@@ -32,6 +32,8 @@ static constexpr int kTrigLookback = 480;
 static constexpr int kTrigKeep = 1500;
 static constexpr bool kDebug = true;
 static constexpr bool kDisableIfXdbot = false;
+// true: fuerza la x del checkpoint justo al empezar el primer paso del sondeo
+static constexpr bool kPatchStartX = false;
 
 static constexpr float kBudgetMs = 10.f;
 static constexpr float kBudgetSlowMs = 3.f;
@@ -133,6 +135,9 @@ static float g_diagMovSim = 0.f;
 static float g_restX = 0.f;
 static float g_sim0X = 0.f;
 static float g_real0X = 0.f;
+static float g_patchX = 0.f;
+static float g_trX1 = 0.f;
+static float g_trX3 = 0.f;
 
 static void clearProbeState() {
     for (auto& s : g_ring) s.cp->release();
@@ -253,6 +258,7 @@ class $modify(FrameBase, GJBaseGameLayer) {
             if (g_frame % kSnapEvery == 0) pushSnap(pl);
         }
         if (pl && !isHalfTick && g_probing && m_player1) {
+            if (kPatchStartX && g_simLog.empty()) m_player1->setPositionX(g_patchX);
             g_simLog.push_back({g_probeBase + (g_probeTick - g_probeTick0),
                 m_player1->getPositionX(), m_player1->getPositionY()});
         }
@@ -332,6 +338,7 @@ class $modify(FrameLayer, PlayLayer) {
     // 1 sobrevive, 0 muere, -1 invalido, -2 desviado (solo con kStrictDrift)
     int survives(const Pending& p, int d) {
         this->loadFromCheckpoint(p.base);
+        if (m_player1) g_patchX = m_player1->getPositionX();
 
         if (kDebug && d == 0 && m_player1) {
             if (auto bp = posAt(p.baseFrame)) {
@@ -364,7 +371,9 @@ class $modify(FrameLayer, PlayLayer) {
                 g_own = false;
                 k++;
             }
+            if (kDebug && d == 0 && t == p.baseFrame && m_player1) g_trX1 = m_player1->getPositionX();
             if (!stepFrame()) break;
+            if (kDebug && d == 0 && t == p.baseFrame && m_player1) g_trX3 = m_player1->getPositionX();
             if (m_player1 && m_player1->m_isDead) g_probeDead = true;
         }
         g_probing = false;
@@ -486,6 +495,9 @@ class $modify(FrameLayer, PlayLayer) {
         g_restX = 0.f;
         g_sim0X = 0.f;
         g_real0X = 0.f;
+        g_patchX = 0.f;
+        g_trX1 = 0.f;
+        g_trX3 = 0.f;
         g_hudDirty = true;
 
         CCNode* parent = this;
@@ -582,7 +594,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {} v7", g_frame);
+            std::string s = fmt::format("Frame: {} v8", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
@@ -605,10 +617,10 @@ class $modify(FrameLayer, PlayLayer) {
         }
         if (kDebug && f->diagLabel) {
             std::string s = fmt::format(
-                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}\nrest x {:.1f} sim0 {:.1f} real0 {:.1f}",
+                "dev paso {} dx {:.2f} dy {:.2f}\nefecto click dy {:.2f}\nx sim {:.1f} real {:.1f}\nmov real {:.3f} sim {:.3f}\nadv {} tw {:.3f}\nrest dx {:.2f} dy {:.2f}\nrest x {:.1f} sim0 {:.1f} real0 {:.1f}\nx pre {:.1f} post {:.1f}",
                 g_diagStep, g_diagDx, g_diagDy, g_diagEffect, g_diagXsim, g_diagXreal,
                 g_diagMovReal, g_diagMovSim, g_lastAdv, g_tw, g_restDx, g_restDy,
-                g_restX, g_sim0X, g_real0X);
+                g_restX, g_sim0X, g_real0X, g_trX1, g_trX3);
             f->diagLabel->setString(s.c_str());
         }
     }
