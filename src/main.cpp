@@ -571,7 +571,7 @@ class $modify(FrameLayer, PlayLayer) {
         auto& f = m_fields;
         f->hudTick++;
         if (f->frameLabel && f->hudTick % 3 == 0) {
-            std::string s = fmt::format("Frame: {}", g_frame);
+            std::string s = fmt::format("Frame: {} v6", g_frame);
             f->frameLabel->setString(s.c_str());
         }
         if (!g_hudDirty || f->hudTick % 6 != 0) return;
