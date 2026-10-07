@@ -20,9 +20,9 @@ static constexpr int kBack = 5;
 static constexpr int kFwd = 5;
 static constexpr int kSnapEvery = 5;
 static constexpr int kMargin = 2;
-static constexpr int kHorizon = 180;
-static constexpr int kMinHorizon = 120;
-static constexpr size_t kMaxPending = 10;
+static constexpr int kHorizon = 120;
+static constexpr int kMinHorizon = 90;
+static constexpr size_t kMaxPending = 30;
 static constexpr int kNoClick = 1000;
 static constexpr float kPosTol = 0.1f;
 static constexpr float kStepDt = 0.9999f / 240.f;
@@ -33,8 +33,8 @@ static constexpr int kTrigKeep = 1500;
 static constexpr bool kDebug = true;
 static constexpr bool kDisableIfXdbot = false;
 
-static constexpr float kBudgetMs = 4.f;
-static constexpr float kBudgetSlowMs = 1.f;
+static constexpr float kBudgetMs = 10.f;
+static constexpr float kBudgetSlowMs = 3.f;
 static constexpr float kSlowFrameMs = 20.f;
 
 // ---------- Estado ----------
@@ -595,8 +595,8 @@ class $modify(FrameLayer, PlayLayer) {
 
         if (!skip && !g_pending.empty() && m_isPracticeMode && m_player1 && !m_player1->m_isDead) {
             while (g_pending.size() > kMaxPending) {
-                g_pending.front().base->release();
-                g_pending.pop_front();
+                g_pending.back().base->release();
+                g_pending.pop_back();
             }
 
             auto live = this->createCheckpoint();
